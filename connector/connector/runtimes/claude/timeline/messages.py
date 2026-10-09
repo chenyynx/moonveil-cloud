@@ -506,6 +506,46 @@ class ClaudeMessageProjector:
             )
         return tuple(items)
 
+    def open_tool_calls(self, turn_id: str) -> tuple[ClaudePendingToolCall, ...]:
+        """The tool_use calls of one turn still waiting for their result.
+
+        A read-only snapshot of the same registry the history rebuild reads
+        (`missing_history_tool_result_items`); nothing is added to or removed
+        from it by this call. B2 uses it to pause a scheduled turn's stall
+        clock while ANY call of that turn is unanswered
+        (`.local-dev/claude-watchdog-liveness-tasks.md` §3 D2): a long tool
+        call — Bash, pytest, an Agent wait — is legal silence, and the CLI's
+        own timeout is the backstop, so stillness behind an open call may not
+        be judged as a ghost's stillness.
+
+        Filtered by `turn_id` on purpose. An entry only leaves `_tool_calls`
+        when its `tool_result` arrives, so anything a killed turn or a
+        compaction dropped result for stays registered forever; without the
+        filter it would read as "still pending" and hold every LATER turn's
+        verdicts hostage. Turn ids are minted with `secrets.token_urlsafe`
+        and never reused, so the filter cannot alias two turns.
+
+        Two accepted imprecisions, both deliberately conservative (they can
+        only keep a turn alive longer, never kill it early):
+
+        * an entry whose `tool_result` matched under a different item-id
+          scope (`stable_tool_item_id` keys on the external session id, which
+          a session can claim after the call was projected) is never paired —
+          that turn then reaches its hard cap instead of its stall budget.
+          B5/F1 makes that promise hold for the question shape too: the
+          watchdog's cap exemption comes only from live interaction notices,
+          so a stale `AskUserQuestion` entry is an EXECUTION like any other;
+        * sidechain (subagent) frames are projected under the main turn's id,
+          so a subagent's open call pauses the main turn's stall clock too —
+          D2's accepted reading: the main turn IS waiting on that call.
+        """
+
+        return tuple(
+            pending
+            for pending in self._tool_calls.values()
+            if pending.turn_id == turn_id
+        )
+
     def tool_item(
         self,
         session: ClaudeSession,
@@ -2464,7 +2504,7 @@ def _tool_call_content(
                 "action": dict(tool_input),
             },
         )
-    if tool_name == "AskUserQuestion":
+    if is_interactive_tool_name(tool_name):
         return InputRequestToolContent(
             title=tool_name,
             input=dict(tool_input),
@@ -2706,6 +2746,31 @@ def is_hidden_tool_name(tool_name: str | None) -> bool:
     """
 
     return is_task_event_tool_name(tool_name) or is_title_tool_name(tool_name)
+
+
+def is_interactive_tool_name(tool_name: str | None) -> bool:
+    """The tool whose `can_use_tool` call is a QUESTION, not an approval.
+
+    `AskUserQuestion` is the one tool the interaction controller routes to
+    `request_user_input` rather than `request_tool_approval`
+    (turns/interactions.py) and the one whose tool_use block projects as an
+    input-request card here; both classification sites read this predicate so
+    the name has a single home. `domain/input_requests.py` builds the
+    user-visible notice under the same name but keeps its own literal — the
+    domain layer must not import the timeline layer.
+
+    The scheduled-turn watchdog deliberately does NOT read it (B5/F1,
+    `.local-dev/watchdog-liveness-b4-report.md` §1): a bare open tool_use
+    entry proves nothing about a live question, and classifying one by name
+    turned OFF the hard cap while PAUSING the stall clock — a stale entry
+    (lost result / scope-drift pop-miss) left the turn uncollectable at any
+    age. The watchdog's INTERACTION exemption therefore comes only from live
+    interaction notices
+    (`ClaudeInteractionController.pending_for_session`). The name here serves
+    routing and the card shape, never deadline classification.
+    """
+
+    return tool_name == "AskUserQuestion"
 
 
 def _extract(value: Any, *names: str) -> Any:
