@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from agent_server.core.models import TimelineItem
+from agent_server.core.timeline import (
+    agent_child_parent_item_id,
+    timeline_item_json_bytes,
+)
 from agent_server.infra.db import timeline_items
 from agent_server.infra.db.engine import SQLITE_BACKEND
 
@@ -22,9 +26,37 @@ from agent_server.infra.db.engine import SQLITE_BACKEND
 #: silently advertised as an active card.
 _ACTIVE_AGENT_CARD_STATUSES = frozenset({"pending", "running", "waiting_approval"})
 
+#: Filtered page reads (subagent-internal row exclusion, per-card children)
+#: judge ``content.parentItemId`` in Python, so reaching ``limit + 1``
+#: eligible rows can require walking past many ineligible ones — in
+#: production the children are up to ~3/4 of a heavy session's rows. One
+#: scan step therefore over-fetches four probe windows, which keeps a usual
+#: page inside a single fetch without ever widening the returned set.
+_PAGE_SCAN_BATCH_MULTIPLIER = 4
+
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _agent_child_payload_needle(parent_item_id: str) -> str:
+    """The compact-JSON pair every child row of ``parent_item_id`` carries.
+
+    Stored payloads are always serialized by ``_json_dumps`` (compact
+    separators, ``ensure_ascii=False``), so a row whose parsed
+    ``content.parentItemId`` equals the ID contains this exact
+    ``"parentItemId":"<id>"`` text verbatim — the substring the existence
+    probe matches without parsing any JSON. Serializing the pair with the
+    same json options guarantees the needle's escaping matches the stored
+    payload byte for byte.
+    """
+
+    pair = json.dumps(
+        {"parentItemId": parent_item_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return pair[1:-1]
 
 
 class SqlTimelineStore:
@@ -269,6 +301,222 @@ class SqlTimelineStore:
         items.reverse()
         return items, has_more
 
+    async def list_latest_excluding_agent_children(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        byte_budget: int | None = None,
+    ) -> tuple[list[TimelineItem], bool]:
+        """The newest conversation-view page: subagent-internal rows dropped.
+
+        Same shape as ``list_latest`` (oldest-first items, ``hasMore`` over
+        the returned collection), except rows whose ``content.parentItemId``
+        is a non-empty string — the rows the client folds under an Agent card
+        — do not occupy the window. ``hasMore`` is computed over the filtered
+        rows: an older eligible row exists exactly when a client must page
+        back further. ``byte_budget`` optionally caps the page's serialized
+        size; the snapshot caller leaves it unset because it applies its own
+        aggregate budget to the returned page.
+        """
+
+        return await self._scan_page(
+            session_id,
+            limit=limit,
+            byte_budget=byte_budget,
+            before_order_seq=None,
+            include=_is_not_agent_child,
+        )
+
+    async def list_before_order_seq_excluding_agent_children(
+        self,
+        session_id: str,
+        *,
+        before_order_seq: int,
+        limit: int,
+        byte_budget: int | None = None,
+    ) -> tuple[list[TimelineItem], bool]:
+        """One conversation-view history page, newest→oldest paging.
+
+        The excluding sibling of ``list_before_order_seq``: the returned page
+        is the newest ``limit`` subagent-internal-free rows older than
+        ``before_order_seq``, and ``hasMore``/cursor semantics follow the
+        filtered collection, so a page that is empty in raw rows but has
+        older content behind it still pages correctly.
+        """
+
+        return await self._scan_page(
+            session_id,
+            limit=limit,
+            byte_budget=byte_budget,
+            before_order_seq=before_order_seq,
+            include=_is_not_agent_child,
+        )
+
+    async def list_agent_children(
+        self,
+        session_id: str,
+        *,
+        parent_item_id: str,
+        before_order_seq: int | None,
+        limit: int,
+        byte_budget: int | None = None,
+    ) -> tuple[list[TimelineItem], bool]:
+        """One page of a single card's own subagent-internal rows.
+
+        Returns the newest ``limit`` rows whose ``content.parentItemId``
+        equals ``parent_item_id``, newest→oldest paging like history
+        (``before_order_seq`` is the exclusive cursor; ``None`` starts at the
+        newest row). Rows of any other card — and every non-child row — are
+        never returned; rows of other sessions cannot match because the scan
+        is session-scoped.
+
+        A cheap existence probe runs first: a parent with no child rows at
+        all — the common case for the client only when it asks about a card
+        that has none — returns an empty exhausted page without paying for
+        the filtered full scan.
+        """
+
+        if not await self._agent_children_exist(session_id, parent_item_id):
+            return [], False
+
+        def include(item: TimelineItem) -> bool:
+            return agent_child_parent_item_id(item) == parent_item_id
+
+        return await self._scan_page(
+            session_id,
+            limit=limit,
+            byte_budget=byte_budget,
+            before_order_seq=before_order_seq,
+            include=include,
+        )
+
+    async def _agent_children_exist(
+        self, session_id: str, parent_item_id: str
+    ) -> bool:
+        """Whether any stored row looks like a child of ``parent_item_id``.
+
+        One ``LIMIT 1`` substring match over ``payload_json`` — no payload is
+        JSON-parsed, so a miss costs a fraction of the filtered scan. The
+        LIKE pattern is escaped (``%``/``_``/``\\`` match literally), so the
+        probe only widens at worst: a false positive (the needle happens to
+        appear in unrelated payload text, e.g. inside some tool output) sends
+        the caller through the scan it would have run anyway and cannot
+        change the result; a false negative cannot occur for rows this store
+        writes, because every payload is serialized compactly with the
+        literal pair inlined (see ``_agent_child_payload_needle``), so a
+        parent that does have children always probes positive.
+        """
+
+        needle = _agent_child_payload_needle(parent_item_id)
+        escaped = (
+            needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    select(timeline_items.c.id)
+                    .where(
+                        timeline_items.c.session_id == session_id,
+                        timeline_items.c.payload_json.like(
+                            f"%{escaped}%", escape="\\"
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).first()
+        return row is not None
+
+    async def _scan_page(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        byte_budget: int | None,
+        before_order_seq: int | None,
+        include: Callable[[TimelineItem], bool],
+    ) -> tuple[list[TimelineItem], bool]:
+        """Read one newest→oldest page over the rows ``include`` accepts.
+
+        Raw rows are walked newest-first in keyset-paginated windows and the
+        filtered rows accumulate until either gate trips:
+
+        - the page already holds ``limit`` rows and one more eligible row
+          exists (the count probe — that row must stay reachable through the
+          next page, so ``hasMore`` is true and the page's oldest item is the
+          correct cursor);
+        - adding the next eligible row would exceed ``byte_budget`` (a page
+          never serializes past the budget; at least one row is always kept,
+          so a single oversized row is returned whole rather than split).
+
+        ``hasMore`` is computed over the *filtered* collection, never the raw
+        rows: a whole window of excluded rows never ends the walk, and an
+        empty result means the filtered timeline is genuinely exhausted
+        (``hasMore`` false), so no client is ever handed an empty page with
+        more content behind it. Items come back oldest-first, like every
+        other ``list_*`` reader here.
+        """
+
+        page: list[TimelineItem] = []  # newest-first while accumulating
+        page_bytes = 0
+        has_more = False
+        cursor: tuple[int, int, str] | None = None
+        batch = (limit + 1) * _PAGE_SCAN_BATCH_MULTIPLIER
+        while True:
+            async with self._engine.connect() as conn:
+                statement = timeline_items.select().where(
+                    timeline_items.c.session_id == session_id
+                )
+                if before_order_seq is not None:
+                    statement = statement.where(
+                        timeline_items.c.order_seq < before_order_seq
+                    )
+                if cursor is not None:
+                    statement = statement.where(
+                        tuple_(
+                            timeline_items.c.order_seq,
+                            timeline_items.c.updated_seq,
+                            timeline_items.c.id,
+                        )
+                        < cursor
+                    )
+                rows = (
+                    await conn.execute(
+                        statement.order_by(
+                            timeline_items.c.order_seq.desc(),
+                            timeline_items.c.updated_seq.desc(),
+                            timeline_items.c.id.desc(),
+                        ).limit(batch)
+                    )
+                ).mappings().all()
+            if not rows:
+                break
+            exhausted = len(rows) < batch
+            stop = False
+            for row in rows:
+                item = TimelineItem.model_validate_json(row["payload_json"])
+                if not include(item):
+                    continue
+                if len(page) >= limit:
+                    has_more = True
+                    stop = True
+                    break
+                item_bytes = 0
+                if byte_budget is not None:
+                    item_bytes = timeline_item_json_bytes(item)
+                    if page and page_bytes + item_bytes > byte_budget:
+                        has_more = True
+                        stop = True
+                        break
+                page.append(item)
+                page_bytes += item_bytes
+            if stop or exhausted:
+                break
+            last = rows[-1]
+            cursor = (int(last.order_seq), int(last.updated_seq), str(last.id))
+        page.reverse()
+        return page, has_more
+
     async def list_active_agent_cards(
         self, session_id: str, *, limit: int = 20
     ) -> list[TimelineItem]:
@@ -357,6 +605,16 @@ class SqlTimelineStore:
 def _item_time(item: TimelineItem) -> str | None:
     values = [value for value in (item.createdAt, item.completedAt, item.updatedAt) if value]
     return max(values) if values else None
+
+
+def _is_agent_child_item(item: TimelineItem) -> bool:
+    """Whether a stored row is a subagent-internal row (it has a parent)."""
+
+    return agent_child_parent_item_id(item) is not None
+
+
+def _is_not_agent_child(item: TimelineItem) -> bool:
+    return not _is_agent_child_item(item)
 
 
 def _is_agent_call_item(item: TimelineItem) -> bool:
