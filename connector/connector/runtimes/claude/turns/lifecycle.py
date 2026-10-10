@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from enum import Enum
 from typing import Any
 
 from connector.logging import logger
@@ -108,124 +108,29 @@ from connector.runtimes.claude.turns.interactions import ClaudeInteractionContro
 # transport, killed the host CLI and every subagent in it, and lost the reply.
 POLLED_TURN_WATCHDOG_SECONDS = 30.0
 
-# The adjudicated death sentence for a turn that left the zero-content class
-# (§2/§3 of `.local-dev/claude-watchdog-liveness-tasks.md`, which supersedes
-# the B-batch absolute ceiling this constant used to be). It is not one number
-# any more: a contenting turn is judged by PROGRESS and killed only when its
-# labour frames have stood still while the turn is old enough for the
-# stillness to mean something.
+# The absolute ceiling for a turn that left the zero-content class. It exists
+# so the content gate cannot become "long turns never settle" — the red line
+# in §5 — and it is deliberately on the same magnitude as the CLI's own tool
+# timeouts (Bash 600s, 420s; `idleTimeoutSeconds=600`). The longest tool this
+# product has ever been observed running is 223.4s (AskUserQuestion), so the
+# headroom is wide; the timing is measured from the cast, not from when the
+# content showed up.
 #
-# * FLOOR — the age floor, measured from the cast. No contenting kill is
-#   permitted before it, so a turn whose legal silence happens to cross the
-#   stall budget early in its life is not executed on a technicality.
-# * STALL — the labour stall budget: how long `published_items` and
-#   `consumed_frames` may both stand still before the turn is judged a ghost
-#   that is merely holding the lock. Chrome frames move neither counter
-#   (the content gate's own exclusion), so chrome alone can never buy time.
-# * HARD_CAP — the one timer still measured from the cast, and the only
-#   verdict an always-progressing turn can meet. It exists so this cannot
-#   become "long turns never settle" (the B-batch §5 red line): the
-#   degenerate generation loop whose frames flow forever but never finish is
-#   still bounded.
-#
-# Why the floor/stall pair, not one number: the old absolute ceiling was
-# calibrated on the longest single TOOL (223.4s), not on the longest work
-# CYCLE. The autonomous wake-cycles (a subagent notification mints a turn)
-# run 10-15 minutes of continuous productive work, so the fixed knife cut
-# live turns mid-flight — 8 host-process kills in the week of 2026-10-05,
-# each knife landing seconds to tens of seconds after the turn's last
-# productive frame (§1 autopsy). The 2026-10-09 stopgap (600 -> 1800) only
-# bought time until work cycles caught up again. A turn whose frames keep
-# advancing is never judged dead now, however long it runs; only stillness
-# past the floor is.
-CONTENTING_TURN_FLOOR_SECONDS = 600.0
-CONTENTING_TURN_STALL_SECONDS = 300.0
-CONTENTING_TURN_HARD_CAP_SECONDS = 3600.0
+# STOPGAP (2026-10-09, pp-approved): raised 600.0 -> 1800.0. The 600s value
+# was calibrated on the longest single TOOL, not on the longest work CYCLE:
+# the autonomous wake-cycles (a subagent notification mints a turn) run
+# 10-15 minutes of continuous productive work, so the 600s knife cut live
+# turns mid-flight — 8 host-process kills in the week, 7 of them in the last
+# 30 hours across live sessions (thinking-orb, alias-lineage, ...). 1800s
+# keeps every observed real cycle inside the window while preserving the
+# absolute bound. The root fix — progress arbitration (a contenting turn is
+# killed on labour-frame STALL, not on absolute age) — is specced in
+# `.local-dev/claude-watchdog-liveness-tasks.md` and replaces this number.
+CONTENTING_TURN_WATCHDOG_SECONDS = 1800.0
 
-# The stall arbitration's poll quantum (§3 micro-verdict). The watchdog
-# samples both content counters on its own clock and compares samples; it
-# never touches `drive_turn`'s hot path and adds no per-frame bookkeeping to
-# it. Five seconds is one order of magnitude below the smallest budget it
-# arbitrates (STALL), so the fire can never be late by a meaningful share of
-# any deadline it enforces.
-WATCHDOG_STALL_POLL_SECONDS = 5.0
-
-# G4: why the breaker fired. These values are the whole diagnosis of a
+# G4: why the breaker fired. The two values are the whole diagnosis of a
 # watchdog log line, so they are named once and reused by the fire line, the
 # retirement-skip line and the fatal-close line.
-WATCHDOG_REASON_ZERO_CONTENT = "zero_content_fast_kill"
-# The two contenting verdicts (2026-10-09 micro-verdict §3), replacing the
-# deprecated `containing_turn_ceiling` absolute-age reason: a stalled turn and
-# a turn that never stalls but never finishes.
-WATCHDOG_REASON_CONTENT_STALL = "contenting_turn_stall"
-WATCHDOG_REASON_CONTENT_HARD_CAP = "contenting_turn_hard_cap"
-
-
-class PendingAwait(Enum):
-    """What a contenting turn is visibly waiting on (B2, §3 D2).
-
-    The two signals the exemption is built from:
-
-    * `stall_suspended` — ANY unanswered tool_use call suspends the stall
-      clock. The call is running somewhere and its silence is legal: a
-      223.4s Bash, a pytest run, a subagent wait are all real production
-      shapes, and the CLI's own tool timeout is the backstop. The clock is
-      PAUSED, not merely gated — the pending stretch does not accumulate as
-      silence, because D2 rules it legal; gating alone would fire the verdict
-      the instant a long wait cleared.
-    * `cap_exempt` — the INTERACTION class additionally turns off the hard
-      cap. An unanswered `AskUserQuestion` or approval is a card on the
-      user's screen ("waiting for you"), and killing the turn destroys the
-      question, not just the turn. A pending EXECUTION call does not stop the
-      cap (D3): that is the one bound left on a turn wedged on a tool that
-      never returns.
-
-    INTERACTION is never classified by tool name. Any tool can be held by
-    `can_use_tool`, and a question's own tool_use entry can outlive a broken
-    pair-up (a lost result / a scope-drift pop-miss — B5/F1,
-    `.local-dev/watchdog-liveness-b4-report.md` §1), so the exemption comes
-    only from the interaction notices — the live record that the user is
-    being asked something right now. An open call of any name is EXECUTION:
-    stall clock paused, hard cap armed.
-    """
-
-    NONE = "none"
-    EXECUTION = "execution"
-    INTERACTION = "interaction"
-
-    @property
-    def stall_suspended(self) -> bool:
-        return self is not PendingAwait.NONE
-
-    @property
-    def cap_exempt(self) -> bool:
-        return self is PendingAwait.INTERACTION
-
-
-@dataclass(frozen=True, slots=True)
-class ScheduledWatchdogVerdict:
-    """Why (and with which numbers) the scheduled-turn breaker has to fire.
-
-    `reason` is one of the three constants above. `age_seconds` and
-    `stall_seconds` are the two timers the fire line and the retirement
-    disclosure report: how old the turn was at the verdict, and how long its
-    labour counters had stood still (on the pausable stall clock — B2 pushes
-    its anchor forward while a call is pending). For the zero-content class
-    the two are the same number — no labour was ever observed, so the turn's
-    whole life is the silence.
-    """
-
-    reason: str
-    age_seconds: float
-    stall_seconds: float
-    # B2: what the turn was waiting on when the verdict was reached. NONE for
-    # every verdict that deserved killing without a pending call; a hard-cap
-    # fire can still carry EXECUTION (the stall clock was paused, the absolute
-    # bound was not), and the fire line reports it so "why did the cap kill a
-    # waiting turn" is answerable from the log alone.
-    pending: PendingAwait = PendingAwait.NONE
-
-
 # F1: the `terminalReason` a turn carries when its `completed` was downgraded
 # because the result could not be attributed to it. It reaches the client's turn
 # ledger verbatim, so the condition is visible rather than silently rewritten.
@@ -266,6 +171,31 @@ CONTEXT_PROBE_SWEEP_INTERVAL_SECONDS = 5.0
 # seconds is far below the 15-minute staleness deadline and cheap (a stat per
 # open task), so a stranded card closes promptly without hammering the disk.
 AGENT_CARD_EVIDENCE_SWEEP_INTERVAL_SECONDS = 60.0
+
+# F1 (zombie-agent-card): the kill switch for the snapshot vouch. When on
+# (default), the exemption set `live_agent_task_ids` vouches only for tasks
+# present in BOTH the keep-alive register (`background.active_ids`) and the
+# CLI's newest `background_tasks_changed` snapshot — a task the engine stopped
+# listing loses its exemption and falls back to ordinary evidence judgement.
+# `0`/`off` restores the byte-for-byte old behaviour: the register's full set
+# vouches. Read per call so a test (or an operator) can flip it without a
+# restart. The spec defines exactly those two off-spellings; any other value
+# — garbage included — keeps the default on rather than silently honoring a
+# typo as a kill switch.
+LIVE_VOUCH_ENV: str = "AA_SUBAGENT_LIVE_VOUCH"
+
+
+def _live_vouch_enabled() -> bool:
+    """Whether the CLI snapshot co-signs the live-task exemption (F1)."""
+
+    raw = os.environ.get(LIVE_VOUCH_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "off"}
+
+
+WATCHDOG_REASON_ZERO_CONTENT = "zero_content_fast_kill"
+WATCHDOG_REASON_CONTENT_CEILING = "containing_turn_ceiling"
 
 # G4's client-visible half (pp verdict, 2026-10-04, product-level —
 # .local-dev/ratelimit-fatal-retirement-notice-order.md §2 A). A killed process
@@ -596,22 +526,18 @@ class ClaudeTurnRunner:
         possible user experience is capped at one failed bubble instead of a
         session that is permanently running with the composer disabled.
 
-        The deadline this used to apply unconditionally is now a three-part
-        adjudication (§2/§3 of claude-watchdog-liveness-tasks.md, superseding
-        the B-batch absolute ceiling). The zero-content class keeps the
-        original 30s budget, so the P0 above is untouched. A turn that
+        The deadline this used to apply unconditionally is now two-stage
+        (§2 G1–G3 of claude-watchdog-longrun-tasks.md). The zero-content class
+        keeps the original budget, so the P0 above is untouched; a turn that
         published items or consumed non-chrome frames leaves the fast kill and
-        is judged by progress instead of age: it is killed only when both
-        labour counters have stood still for CONTENTING_TURN_STALL_SECONDS
-        while the turn is at least CONTENTING_TURN_FLOOR_SECONDS old — a turn
-        whose frames keep advancing is never judged dead, however long it runs
-        — with CONTENTING_TURN_HARD_CAP_SECONDS as the one absolute bound left
-        over it (so "long turns never settle" still cannot happen). Both
-        counts exclude everything the queue held up to and including the cast
-        frame — preamble flush + cast, by position, because passive arrival is
-        not labour — so a re-cast's lone residue frame (B5: in-flight
-        `tool_result`, StreamEvent), with or without stale preamble in front of
-        it, still lands in the fast kill it had before B3a.
+        is only bounded by an absolute ceiling. Both counts exclude everything
+        the queue held up to and including the cast frame — preamble flush +
+        cast, by position, because passive arrival is not labour — so a
+        re-cast's lone residue frame (B5: in-flight `tool_result`,
+        StreamEvent), with or without stale preamble in front of it, still
+        lands in the fast kill it had before B3a instead of buying the ghost
+        ten minutes of held lock. The exemption is on the FAST KILL only — a
+        long turn can never become "never settled".
         """
 
         execution.watchdog_task = asyncio.create_task(
@@ -633,66 +559,17 @@ class ClaudeTurnRunner:
     async def _await_watchdog_deadlines(
         execution: ClaudeExecution,
         timeout: float,
-        floor: float,
-        stall: float,
-        hard_cap: float,
-        tick: float,
-        session_id: str,
-        pending_await: Callable[[], PendingAwait],
-    ) -> ScheduledWatchdogVerdict | None:
-        """Wait out the adjudicated deadlines; return why the breaker must fire.
+        ceiling: float,
+    ) -> str | None:
+        """Wait out both deadlines; return why the breaker has to fire.
 
         `None` means the turn settled on its own and there is nothing to do.
 
-        Three timers, three shapes (`.local-dev/claude-watchdog-liveness-
-        tasks.md` §2/§3, which supersedes the batched absolute ceiling):
-
-        * `timeout` — the zero-content fast kill, one `wait_for` measured from
-          the cast. A turn that reaches its end with both counters still at
-          zero is the ghost this breaker exists for and is judged on the spot;
-          neither the floor nor the cap is consulted for it.
-        * `floor`/`stall` — the contenting class is judged by PROGRESS, not by
-          age. From here the watchdog polls (one `tick` between samples) and
-          compares the labour counters with its previous sample: a sample that
-          moved resets the stall clock, and a kill requires the clock to have
-          stood still for `stall` seconds while the turn is at least `floor`
-          seconds old. A turn whose frames keep advancing is therefore never
-          judged dead, however long it runs.
-        * `hard_cap` — the one timer still measured from the cast, and the
-          only verdict a never-stalling turn can meet. It exists so progress
-          arbitration cannot become "long turns never settle": the degenerate
-          loop whose counters move forever but never finish is still bounded.
-
-        The counters are read, never written, so `drive_turn`'s hot path is
-        untouched — the watchdog observes on its own clock, and no per-frame
-        bookkeeping was added anywhere. Chrome frames move neither counter
-        (the content gate's own exclusion), so chrome alone can never push the
-        kill out.
-
-        The stall clock's zero point is the cast. Any progress the polling
-        loop actually observes moves it, so the clock is exact from phase two
-        on; a turn whose last labour happened during the fast-kill window is
-        measured from its cast instead, which can only overstate the silence —
-        and with product numbers the floor (600s) always exceeds that window
-        (30s) plus the stall budget (300s), so the verdict itself never
-        changes: the first permissible fire is still `max(floor, stall)`.
-
-        B2 (§3 D2) suspends both timers while the turn is visibly waiting on
-        something (`pending_await`, sampled per tick, never cached): a stall
-        verdict is withheld whenever ANY tool call is unanswered, and the hard
-        cap is withheld as well for the interaction class — which B5/F1
-        (`_pending_await`) narrows to a LIVE interaction notice; the
-        projection's tool name never exempts this timer. Zero-content turns
-        never reach any of this — the fast kill above returns before the
-        pending state is ever consulted, which is the ordering B2 is required
-        to preserve (a ghost with no frames has nothing to wait on anyway).
-        The pending callable is a parameter, not a method call, so this stays
-        a static adjudicator whose only contact with the live runner is the
-        tick-by-tick fact it is handed — and one that RAISES is contained
-        (B5/F3, B4 §1): treated as NONE for that tick so both timers keep
-        running, logged once per turn, because a broken accessor must not
-        decapitate the adjudication and strand the execution lock with no
-        timer left and no record.
+        The two deadlines are sequential rather than concurrent, which is what
+        "absolute ceiling" means: the fast kill is measured from the cast, and
+        the ceiling is a second wait covering only the time the first one left.
+        A turn that produces content at t=1s is re-armed for the remaining
+        570s; one that produces it at t=599s still has to settle by t=600s.
         """
 
         try:
@@ -701,166 +578,14 @@ class ClaudeTurnRunner:
         except TimeoutError:
             pass
         if not execution.has_turn_content:
-            age = time.monotonic() - execution.started_at_monotonic
-            # No labour was ever observed, so this turn's whole life is the
-            # silence: both timers report the same number.
-            return ScheduledWatchdogVerdict(
-                reason=WATCHDOG_REASON_ZERO_CONTENT,
-                age_seconds=age,
-                stall_seconds=age,
+            return WATCHDOG_REASON_ZERO_CONTENT
+        try:
+            await asyncio.wait_for(
+                execution.finished.wait(), max(0.0, ceiling - timeout)
             )
-        observed = (execution.published_items, execution.consumed_frames)
-        last_labour_at = execution.started_at_monotonic
-        deferral_logged = False
-        pause_logged = False
-        sampler_error_logged = False
-        while True:
-            if execution.finished.is_set():
-                return None
-            now = time.monotonic()
-            age = now - execution.started_at_monotonic
-            try:
-                pending = pending_await()
-            except Exception:  # noqa: BLE001 - a broken sampler must not kill it
-                # F3 (B4 §1): the sampler reads two live objects; a raise in
-                # it used to kill this task on the spot — no verdict, no
-                # fire, no terminal, the lock held, no log until task-GC
-                # time. Degrade to the most conservative reading (NONE: the
-                # stall clock runs, the cap stays armed), keep polling so a
-                # recovered accessor is picked up again, and say so once per
-                # turn instead of once per tick.
-                pending = PendingAwait.NONE
-                if not sampler_error_logged:
-                    sampler_error_logged = True
-                    logger.warning(
-                        "Claude watchdog pending await sampler raised; "
-                        "treating as none session_id={} turn_id={}",
-                        session_id,
-                        execution.turn_id,
-                        exc_info=True,
-                    )
-            if age >= hard_cap and not pending.cap_exempt:
-                # The absolute bound, checked first: when it and the stall
-                # verdict are both due, the hard cap is the truer name. It is
-                # withheld only for a pending INTERACTION (B2): an on-screen
-                # question or approval is a visible "waiting for you" state,
-                # and killing the turn answers it with a process death. A
-                # pending EXECUTION call does not stop it — D3 keeps the cap
-                # as the one bound on a turn wedged on a tool that never
-                # returns.
-                return ScheduledWatchdogVerdict(
-                    reason=WATCHDOG_REASON_CONTENT_HARD_CAP,
-                    age_seconds=age,
-                    stall_seconds=now - last_labour_at,
-                    pending=pending,
-                )
-            counts = (execution.published_items, execution.consumed_frames)
-            if counts != observed:
-                silence_broken = now - last_labour_at
-                observed = counts
-                last_labour_at = now
-                if age >= floor:
-                    # The observation surface (B1 §4): this sample pushed a
-                    # kill out — without it the stall clock kept running and
-                    # the turn would have been judged dead on schedule. Counted
-                    # on the execution, told once per turn in the log.
-                    execution.watchdog_progress_deferrals += 1
-                    if not deferral_logged:
-                        deferral_logged = True
-                        logger.warning(
-                            "Claude watchdog stall verdict deferred by labour "
-                            "progress session_id={} turn_id={} age_seconds={:.1f} "
-                            "silence_broken_seconds={:.1f} published_items={} "
-                            "consumed_frames={} deferrals={}",
-                            session_id,
-                            execution.turn_id,
-                            age,
-                            silence_broken,
-                            execution.published_items,
-                            execution.consumed_frames,
-                            execution.watchdog_progress_deferrals,
-                        )
-            if pending.stall_suspended:
-                # B2: the clock is PAUSED, not merely gated — the pending
-                # stretch is legal silence and does not accumulate. When the
-                # call is answered, its result frame is labour and re-anchors
-                # the clock anyway; when the pending clears without a frame
-                # (an approval resolved), the silence only starts counting
-                # from the clearing tick. Gating alone would instead fire the
-                # verdict the instant a long wait cleared.
-                if not pause_logged and age >= floor:
-                    # The observation surface for B2: a turn that outlived
-                    # the floor while waiting on something. Told once per
-                    # turn; deliberately not counted as a progress deferral —
-                    # waiting is not work.
-                    pause_logged = True
-                    logger.warning(
-                        "Claude watchdog stall clock paused by a pending await "
-                        "session_id={} turn_id={} pending={} age_seconds={:.1f} "
-                        "stall_seconds={:.1f}",
-                        session_id,
-                        execution.turn_id,
-                        pending.value,
-                        age,
-                        now - last_labour_at,
-                    )
-                last_labour_at = now
-            else:
-                stall_elapsed = now - last_labour_at
-                if age >= floor and stall_elapsed >= stall:
-                    return ScheduledWatchdogVerdict(
-                        reason=WATCHDOG_REASON_CONTENT_STALL,
-                        age_seconds=age,
-                        stall_seconds=stall_elapsed,
-                    )
-            try:
-                await asyncio.wait_for(execution.finished.wait(), tick)
-            except TimeoutError:
-                continue
             return None
-
-    def _pending_await(
-        self, session: ClaudeSession, execution: ClaudeExecution
-    ) -> PendingAwait:
-        """Classify what this turn is visibly waiting on (B2, §3 D2).
-
-        Two sources, read live at every watchdog tick and never cached:
-
-        * the interaction notices — an approval (`can_use_tool` holds ANY
-          tool name, so this cannot be classified by name) or a question
-          still open for this session. A live notice is the ONLY fact that
-          grants INTERACTION: it is the record that the user is being asked
-          something right now;
-        * the projection's open tool calls for THIS turn — a tool_use whose
-          `tool_result` has not arrived. Any such call is a pending
-          EXECUTION: its silence is legal (a Bash, a pytest, a subagent
-          wait), so the stall clock pauses, but the hard cap stays armed.
-
-        B5/F1 (`.local-dev/watchdog-liveness-b4-report.md` §1): the tool
-        NAME no longer classifies anything here. The real CLI routes
-        AskUserQuestion through `can_use_tool` in every permission mode
-        (B4 §2a, probe-verified), so a legitimate question ALWAYS has a live
-        notice — and "frame present, notice absent" can only mean the
-        pair-up broke (item-id scope drift on the result, a dropped result
-        on an answered question, a discarded sidechain call). Classified by
-        name, those stale entries granted `cap_exempt` at ANY age and left
-        the execution lock with no timer able to collect it; as EXECUTION
-        the same shape still pauses the stall clock but is closed by its
-        hard cap — which is what `open_tool_calls`' own docstring promises
-        for unpaired leftovers.
-
-        Both sources are read-only snapshots; nothing here writes projector
-        or controller state. The `_tool_calls` registry is filtered by turn
-        id (see `open_tool_calls`) so dead turns' leftovers cannot excuse
-        this one; the notices are session-scoped because they die with their
-        turn (`close_open_interaction_notices` runs on every terminal path).
-        """
-
-        if self.interactions.pending_for_session(session.session_id):
-            return PendingAwait.INTERACTION
-        if self.timeline.open_tool_calls(execution.turn_id):
-            return PendingAwait.EXECUTION
-        return PendingAwait.NONE
+        except TimeoutError:
+            return WATCHDOG_REASON_CONTENT_CEILING
 
     async def _scheduled_watchdog(
         self,
@@ -868,62 +593,26 @@ class ClaudeTurnRunner:
         execution: ClaudeExecution,
         response: ClaudeResponse,
         timeout: float,
-        floor: float | None = None,
-        stall: float | None = None,
-        hard_cap: float | None = None,
-        tick: float | None = None,
+        ceiling: float | None = None,
     ) -> None:
-        if floor is None:
-            floor = CONTENTING_TURN_FLOOR_SECONDS
-        if stall is None:
-            stall = CONTENTING_TURN_STALL_SECONDS
-        if hard_cap is None:
-            hard_cap = CONTENTING_TURN_HARD_CAP_SECONDS
-        if tick is None:
-            tick = WATCHDOG_STALL_POLL_SECONDS
-        verdict = await self._await_watchdog_deadlines(
-            execution,
-            timeout,
-            floor,
-            stall,
-            hard_cap,
-            tick,
-            session_id=session.session_id,
-            # Sampled per tick, never cached: the turn may answer its own
-            # question, be waiting when the cap arrives, or clear the wait
-            # mid-flight, and the verdict must be read off the state that
-            # exists at that tick.
-            pending_await=lambda: self._pending_await(session, execution),
-        )
-        if verdict is None:
+        if ceiling is None:
+            ceiling = CONTENTING_TURN_WATCHDOG_SECONDS
+        reason = await self._await_watchdog_deadlines(execution, timeout, ceiling)
+        if reason is None:
             return
-        reason = verdict.reason
-        # The budget the turn actually ran out of. Named once because three
-        # consumers depend on it agreeing: the failed terminal's text, the fire
-        # line, and the process-retirement disclosure's `stuckSeconds`. A stall
-        # fire reports the stall budget (what stood still), a hard-cap fire the
-        # cap (the absolute bound), the ghost the fast kill.
-        if reason == WATCHDOG_REASON_CONTENT_STALL:
-            stuck_budget = stall
-        elif reason == WATCHDOG_REASON_CONTENT_HARD_CAP:
-            stuck_budget = hard_cap
-        else:
-            stuck_budget = timeout
         connection = response.connection
         active_tasks = len(connection.background.active_ids)
         logger.warning(
-            "Claude scheduled turn watchdog fired reason={} pending={} "
+            "Claude scheduled turn watchdog fired reason={} "
             "published_items={} consumed_frames={} active_tasks={} "
-            "age_seconds={:.1f} stall_seconds={:.1f} budget_seconds={:.1f} "
+            "no terminal within {}s (absolute ceiling {}s), "
             "forcing failed terminal session_id={} turn_id={}",
             reason,
-            verdict.pending.value,
             execution.published_items,
             execution.consumed_frames,
             active_tasks,
-            verdict.age_seconds,
-            verdict.stall_seconds,
-            stuck_budget,
+            timeout if reason == WATCHDOG_REASON_ZERO_CONTENT else ceiling,
+            ceiling,
             session.session_id,
             execution.turn_id,
         )
@@ -939,6 +628,10 @@ class ClaudeTurnRunner:
                 async with connection.stuck_report_lock:
                     connection.stuck_timeout_reports -= 1
 
+        # The budget the turn actually ran out of. Named once because three
+        # consumers depend on it agreeing: the failed terminal's text, the fire
+        # line, and the process-retirement disclosure's `stuckSeconds`.
+        stuck_budget = timeout if reason == WATCHDOG_REASON_ZERO_CONTENT else ceiling
         try:
             settled = await self.finish_execution(
                 session=session,
@@ -1252,8 +945,22 @@ class ClaudeTurnRunner:
             # never through its own tool_use_id, which for a local_bash task
             # points *inside* the subagent and would attach a Bash row to a
             # task that has no card (findings §8.11). An unbound task (its
-            # task_started was filtered or missed) is not projected.
+            # task_started was filtered or missed) used to be silently
+            # dropped here even when the card it belongs to exists.
             tool_use_id = self.agent_task_calls.get(key)
+            if tool_use_id is None:
+                # F3 (zombie-agent-card, binding gap): the exemption the
+                # background register grants is wider than this binding —
+                # observed() vouches on any task frame while only a
+                # local_agent task_started *with* a tool_use_id ever binds —
+                # so a terminal frame for a card whose binding was never
+                # written (task_started missed, or filtered) used to vanish.
+                # Reverse-lookup the card through its own agents map (the
+                # task id is the key); a task with no card — local_bash and
+                # friends — still returns nothing and stays unprojected.
+                tool_use_id = self.timeline.tool_use_id_for_task(
+                    session, event.task_id
+                )
             if tool_use_id is None:
                 return
             if (
@@ -1468,6 +1175,15 @@ class ClaudeTurnRunner:
                     continue
                 await self.notifications.timeline_activity.timeline_item_upsert(item)
                 published += 1
+                if evidence:
+                    # F1 release (zombie-agent-card): the closure just
+                    # published, so the register's pin on these tasks is now
+                    # provably stale — drop it or the exemption set (and with
+                    # it arm_idle) stays wedged by ids whose terminal frame
+                    # will never come. Only after a successful upsert, and
+                    # only for judged evidence closures: the stop path's own
+                    # semantics are untouched.
+                    self._release_evidence_tasks(session, item)
             if published:
                 logger.warning(
                     "Claude open subagent cards closed without a task "
@@ -1484,16 +1200,64 @@ class ClaudeTurnRunner:
             )
             return 0
 
-    def live_agent_task_ids(self, session: ClaudeSession) -> frozenset[str]:
-        """Tasks the live transport vouches for (the F2 provider).
+    def _release_evidence_tasks(
+        self,
+        session: ClaudeSession,
+        item: RuntimeTimelineItem,
+    ) -> None:
+        """Release the closed card's task ids from the keep-alive register.
 
-        A connection that is alive and not closing is the only qualification:
-        its ``background.active_ids`` is the transport's own set of tasks it
-        knows to be running right now. Deliberately NOT gated on
-        ``session.execution`` — a background subagent keeps running while the
-        main session sits idle, and a null execution does not mean the process
-        stopped — and deliberately not ``connection.task_ids``, the broader
-        reconciliation set that retains finished ids.
+        The item just published is an evidence closure: every open task on
+        that card was judged terminal by the oracle, so any id still sitting
+        in ``background.active_ids`` for one of them is the stale pin this
+        batch exists to lift (zombie-agent-card §0 — a terminal frame the
+        resume/notification gap swallowed never discards it, and the pinned
+        id then keeps both the exemption set and arm_idle wedged forever).
+        The agents map is keyed by task id; ids absent from the register
+        discard as a no-op, and a missing connection (session already
+        detached) simply skips — releasing is a bonus, never a dependency.
+        """
+
+        raw_agents = item.content.get("agents")
+        if not isinstance(raw_agents, Mapping):
+            return
+        connection = self.connections.get(session.session_id)
+        if connection is None:
+            return
+        for task_id in raw_agents:
+            if isinstance(task_id, str) and task_id:
+                connection.background.release(task_id)
+
+    def live_agent_task_ids(self, session: ClaudeSession) -> frozenset[str]:
+        """Tasks the live transport vouches for (the F2 provider, F1 filtered).
+
+        A connection that is alive and not closing is the qualification; the
+        task set itself is now the intersection of two registers (F1,
+        zombie-agent-card):
+
+        * ``background.active_ids`` — the transport's keep-alive register.
+          Still deliberately NOT gated on ``session.execution`` (a background
+          subagent runs while the main session sits idle) and never
+          ``connection.task_ids`` (the broader reconciliation set that
+          retains finished ids);
+        * ``background.last_snapshot_ids`` — the CLI's own newest snapshot of
+          outstanding work, when one has been seen. The register only ever
+          loses an id to a live terminal frame, so a task whose terminal the
+          resume/notification gap swallowed stays pinned there forever and
+          used to blind every evidence closure behind this exemption. The
+          snapshot is the engine's stronger liveness word: a task it no
+          longer lists loses the exemption and falls back to ordinary
+          evidence judgement. When no snapshot has ever arrived
+          (``last_snapshot_ids is None`` — a fresh connection, or the env
+          kill switch ``AA_SUBAGENT_LIVE_VOUCH`` = ``0``/``off``), this
+          returns the full register set: byte-for-byte the old, conservative
+          behaviour.
+
+        The snapshot never edits the register — keep-alive bookkeeping
+        (arm_idle, drain waits) keeps its own semantics; only this exemption
+        consumer narrows. A card closed from evidence then *releases* its
+        task ids (``background.release``) so the pin cannot outlive the
+        judgement.
 
         Wired to the reader/syncer as their ``live_task_ids`` provider so a
         history rebuild never closes a card whose task the transport still
@@ -1503,7 +1267,14 @@ class ClaudeTurnRunner:
         connection = self.connections.get(session.session_id)
         if connection is None or connection.closing:
             return frozenset()
-        return frozenset(connection.background.active_ids)
+        background = connection.background
+        active = frozenset(background.active_ids)
+        if not _live_vouch_enabled():
+            return active
+        snapshot = background.last_snapshot_ids
+        if snapshot is None:
+            return active
+        return active & snapshot
 
     def _attached_agent_task_ids(self, session: ClaudeSession) -> frozenset[str]:
         """The ``attached`` set the oracle exempts from the file-staleness closure.
@@ -2328,9 +2099,8 @@ class ClaudeTurnRunner:
             # `tool_result` or a StreamEvent — with or without stale preamble
             # in front of it — then nothing ever → stays (0, 0) → 30s fast
             # kill) from a wake that keeps working (13:49: 248.6s, 155
-            # timeline items → leaves the fast kill for the progress
-            # arbitration, never killed while its frames keep advancing).
-            # Human/pending turns are never stamped
+            # timeline items → leaves the fast kill, bounded only by the
+            # ceiling). Human/pending turns are never stamped
             # (`cast_frame is None`) so `cast_reached` starts True and every
             # post-cast frame is judged by the single `_is_wire_chrome`
             # authority, exactly as a scheduled turn's are.
@@ -2663,8 +2433,7 @@ class ClaudeTurnRunner:
                 # shorter and looks like the obvious cleanup; it is wrong. It
                 # exempts any turn that receives a single non-chrome frame after the
                 # cast, which pushes a zero-content ghost out of the 30s fast kill
-                # and into the contenting arbitration — where a silent turn lives
-                # until the 600s floor — and a held execution lock refuses
+                # and into the 600s ceiling — and a held execution lock refuses
                 # user messages outright (`turns/actions.py`:
                 # `claude_turn_already_running`), so that is ten minutes of an
                 # unusable session, bought to remove a hypothetical.
@@ -2680,8 +2449,7 @@ class ClaudeTurnRunner:
                 # the apparent duplication with `drive_turn` below — and it is
                 # wrong: it exempts any turn that receives one non-chrome frame
                 # after the cast, which pushes a zero-content ghost from the 30s
-                # fast kill out to the contenting arbitration (600s floor before
-                # any verdict). A held execution lock refuses
+                # fast kill out to the 600s ceiling. A held execution lock refuses
                 # user messages outright (`turns/actions.py`: `claude_turn_already_running`),
                 # so that is ten minutes of an unusable session, bought to remove a
                 # hypothetical. The duplication is instead pinned from the outside

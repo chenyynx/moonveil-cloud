@@ -30,6 +30,7 @@ and never touch the real disk or wall time.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -49,12 +50,16 @@ from connector.runtimes.claude.timeline.agent_calls import (
     DISPATCH_TOOL_NAME,
     SEND_MESSAGE_TOOL_NAME,
     agent_task_terminal_status,
+    is_async_agent_receipt,
 )
 
 #: How a card was closed from engine evidence. Carried on the item's
 #: ``content.metadata`` so a closure is auditable next to the status the client
-#: renders.
-ClosedByEvidence = Literal["terminalNotice", "agentFileStale", "neverStarted"]
+#: renders. All values are free JSON keys (no contract enum); clients read
+#: them beside ``kind`` and must tolerate new ones.
+ClosedByEvidence = Literal[
+    "terminalNotice", "agentFileStale", "neverStarted", "ageBounded"
+]
 
 #: An ``async_launched`` dispatch with no subagent transcript at all is judged
 #: dead once its launch receipt is older than this. Long enough that an ordinary
@@ -69,6 +74,131 @@ SUBAGENT_START_GRACE_SECONDS: float = 120.0
 #: default (宁长勿短但有界); it is deliberately generous because a false close
 #: is worse than a slow one, and the value is overridable at construction.
 SUBAGENT_STALE_SECONDS: float = 900.0
+
+#: The hard age ceiling (T2, ``.local-dev/stale-residue-selfheal-tasks.md``,
+#: 2026-10-09): a task whose newest launch/survival evidence is older than
+#: this — with no terminal notice and no live signal — closes as
+#: ``interrupted`` even while its transcript file still *looks* fresh (the
+#: mtime a restore or a copy re-stamped, a writer gone without ever emitting
+#: a terminal event). No legitimate subagent runs anywhere near this long
+#: (measured background work sits in the ~30-minute range), so the value is
+#: far above every honest silence and a false close is impossible for any
+#: task the transport still vouches for — ``attached``/live tasks are exempt
+#: from it too, except when the ceiling's own raw-transcript anchor (not a
+#: receipt guess) is itself past the bound (F2 pierce, zombie-agent-card).
+#: Overridable at construction; the environment variable below
+#: supplies the default and a value ``<= 0`` disables the judgement.
+SUBAGENT_AGE_BOUND_SECONDS: float = 24 * 60 * 60.0
+
+#: Environment override for :data:`SUBAGENT_AGE_BOUND_SECONDS`, in seconds.
+#: Unset keeps the default; an unparsable value or one under
+#: :data:`SUBAGENT_AGE_BOUND_FLOOR_SECONDS` is REFUSED, which means 0 (the
+#: judgement is off) — never the default, and never the value that was typed.
+#: Values ``<= 0`` clamp to 0, the documented "disabled" value (the kill
+#: switch). ``24h`` / ``90m`` / ``1.5h`` / ``30s`` are accepted.
+SUBAGENT_AGE_BOUND_ENV: str = "AA_SUBAGENT_AGE_BOUND_SECONDS"
+
+#: The smallest ceiling this judgement may be given. A ceiling this low stops
+#: being a backstop and becomes a reaper: it fires on work that is demonstrably
+#: still running. 60s was not low enough for that to be unreachable — a
+#: background subagent dispatched 61s ago whose transcript was written 2s ago
+#: is alive, and a 60s ceiling closed it as ``ageBounded`` with no transport
+#: vouch required (R1b R2-4). The floor now sits an order of magnitude above
+#: the longest legitimate background run (~30min measured, task sheet §3 T3),
+#: so the only ceilings this judgement can be given are ones no live task can
+#: reach. Refused rather than clamped, because silently raising an operator's
+#: 60 back to 24h would hide the typo; the fix is the log line and a value
+#: they meant.
+#:
+#: Note what this floor deliberately does NOT require: file silence. The
+#: re-stamped-mtime residue T2 exists to close is precisely the case where the
+#: session transcript is still being written while the task is dead, so
+#: demanding a stale file here would disarm the rule against its own target.
+SUBAGENT_AGE_BOUND_FLOOR_SECONDS: float = 60.0 * 60.0
+
+#: Duration suffixes accepted after the number. Bare numbers are seconds,
+#: which is what the variable name says; the suffixes are there so the natural
+#: spelling of a day (``24h``) cannot land on "unparsable" — and, now that an
+#: unparsable value means "off" rather than "the default", that distinction
+#: matters.
+_AGE_BOUND_SUFFIX_SECONDS: dict[str, float] = {
+    "s": 1.0,
+    "m": 60.0,
+    "h": 60 * 60.0,
+    "d": 24 * 60 * 60.0,
+}
+
+
+def _parse_age_bound_seconds(raw: str) -> float | None:
+    """Seconds named by ``raw``, or ``None`` when the value is not usable."""
+
+    text = raw.strip().lower()
+    if not text:
+        return None
+    multiplier = 1.0
+    if text[-1].isalpha():
+        multiplier = _AGE_BOUND_SUFFIX_SECONDS.get(text[-1])
+        if multiplier is None:
+            return None
+        text = text[:-1].strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    # `nan` compares false against everything, so it would sail through the
+    # floor check below and reach the oracle as a ceiling that never fires.
+    # `inf` parses fine and is just as useless. Both are rejected here.
+    if not math.isfinite(value):
+        return None
+    return value * multiplier
+
+
+def _age_bound_seconds_from_env() -> float:
+    """The age-ceiling default, honouring ``SUBAGENT_AGE_BOUND_ENV``.
+
+    Read once per oracle construction (not at import) so the deployed
+    process environment and the tests drive the same code path.
+
+    Unlike the connector's other float knobs this one fails SAFE, and the
+    asymmetry is the point (R1 P2-4). A ceiling that comes out too small
+    closes live work — ``0.5`` means half a second, which is below the
+    dispatch-to-receipt gap of every task in the library, so the sweep and
+    every rebuild would sweep the floor and close all of them. A ceiling that
+    comes out too large merely does nothing until the next projection bump
+    reaches the residue. So: unset keeps the documented default; anything
+    unusable (unparsable, ``nan``, ``inf``, empty, below the floor) is refused
+    and means 0, the kill switch, with a warning that names the rejected text.
+    A too-large ceiling is not worth a second opinion — it is inert.
+    """
+
+    raw = os.environ.get(SUBAGENT_AGE_BOUND_ENV)
+    if raw is None:
+        return SUBAGENT_AGE_BOUND_SECONDS
+    value = _parse_age_bound_seconds(raw)
+    if value is None:
+        logger.warning(
+            "subagent age bound unusable; the judgement is disabled "
+            "env={} value={} default_seconds={}",
+            SUBAGENT_AGE_BOUND_ENV,
+            raw,
+            SUBAGENT_AGE_BOUND_SECONDS,
+        )
+        return 0.0
+    if value <= 0:
+        # The documented kill switch, and the same posture as a refused value:
+        # no ceiling, no closures.
+        return 0.0
+    if value < SUBAGENT_AGE_BOUND_FLOOR_SECONDS:
+        logger.warning(
+            "subagent age bound below the floor; the judgement is disabled "
+            "env={} value={} floor_seconds={}",
+            SUBAGENT_AGE_BOUND_ENV,
+            raw,
+            SUBAGENT_AGE_BOUND_FLOOR_SECONDS,
+        )
+        return 0.0
+    return value
+
 
 #: Tolerance around a terminal notice's own timestamp when comparing it to the
 #: file mtime. The notice is written a beat after the last transcript append, so
@@ -228,6 +358,10 @@ class ClaudeSubagentOracle:
     file_probe: FileProbe = probe_agent_file
     start_grace_seconds: float = SUBAGENT_START_GRACE_SECONDS
     stale_seconds: float = SUBAGENT_STALE_SECONDS
+    #: The age-bounded closure's hard ceiling (T2): see
+    #: `SUBAGENT_AGE_BOUND_SECONDS`. Defaulted from the environment at
+    #: construction (``SUBAGENT_AGE_BOUND_ENV``); ``<= 0`` disables the rule.
+    age_bound_seconds: float = field(default_factory=_age_bound_seconds_from_env)
     mtime_tolerance_seconds: float = SUBAGENT_MTIME_TOLERANCE_SECONDS
 
     def _resolve_projects_dir(self) -> Path:
@@ -264,6 +398,8 @@ class ClaudeSubagentOracle:
         cwd: str | None,
         terminal_events: Sequence[tuple[int | None, ClaudeTaskEvent]] = (),
         receipt_age_seconds: float | None = None,
+        ceiling_age_seconds: float | None = None,
+        ceiling_anchored: bool = False,
         attached_live: bool = False,
         now_ms: int | None = None,
     ) -> AgentTaskEvidence | None:
@@ -277,11 +413,21 @@ class ClaudeSubagentOracle:
            evidence beyond the mtime tolerance (F4 arbitration, below).
         2. Otherwise, an ``attached`` task (a live turn is driving the process)
            is never closed on file silence alone — a long tool call writes
-           nothing for a while and must not be mistaken for dead.
+           nothing for a while and must not be mistaken for dead. The
+           exemption bends in exactly one place (F2, zombie-agent-card): the
+           age ceiling pierces it when the *ceiling's own* raw-transcript
+           anchor is older than the bound, because no legitimate run —
+           attached or not — stays unproven for that long; without that
+           anchored age no clock judgement closes a task the transport still
+           vouches for, and the caller abstains.
         3. No terminal notice: a missing transcript past the start grace closes
            as ``interrupted`` (never started); a transcript silent past the
            stale deadline closes as ``interrupted``; a fresh transcript stays
-           running.
+           running — except past the hard age ceiling (T2, ``ageBounded``):
+           when the newest launch/survival evidence is older than
+           ``age_bound_seconds`` and no live signal vouches for the task, the
+           card closes as ``interrupted`` and the freshness of the file is
+           precisely what that rule declines to trust.
 
         F4 arbitration (``.local-dev/subagent-alias-durability-tasks.md`` rt2,
         red team CONFIRMED): the D3 sweep lets a terminal notice close a task
@@ -299,14 +445,16 @@ class ClaudeSubagentOracle:
         newer than the receipt is still read as superseded rather than trusted
         on sub-tolerance noise.
 
-        The receipt age comes from the newest ``agentId:`` mention, which later
+        The receipt age comes from the newest ``agentId:`` receipt, which later
         transcript text can *pollute* to be newer than the true launch; that
         bias shrinks the age, pushes ``receipt_time`` later, and so errs toward
         *superseding* notices — keeping attached tasks open. The bias is
         therefore conservative in the one direction that cannot lie about a
         live agent. With no receipt age, or a notice with no time, there is
         nothing to arbitrate and rule 1 stands exactly as before, as it does
-        for non-attached tasks.
+        for non-attached tasks. This is also why the ceiling reads its own age
+        instead: a newer anchor is harmless when it supersedes a notice, and
+        unbounded when it defers a closure.
 
         Time order is the OUTER arbitration for one task's own notice
         sequence; ``closure_rank`` remains the INNER arbiter among verdicts of
@@ -354,6 +502,32 @@ class ClaudeSubagentOracle:
         # No notice that closes the task. Now the file decides — but only when
         # nobody is actively driving the process.
         if attached_live:
+            # F2 (zombie-agent-card, companion defect B): the age ceiling
+            # pierces the attached exemption — but only on its OWN anchor.
+            # The T2 premise "no legitimate run stays silent this long" holds
+            # for attached tasks too, and an attached task whose pin is a
+            # stale register entry (the resume/notification gap) would
+            # otherwise abstain forever: F1 narrows the exemption from the
+            # snapshot side, this closes the shape where the connection never
+            # saw a snapshot at all. `ceiling_anchored` is required and NOT
+            # widened to the receipt age the way the non-attached branch
+            # falls back: without a raw-transcript anchor there is no age
+            # this judgement may trust for a task the transport vouches for,
+            # so it abstains and the server janitor remains that form's
+            # floor. A fresh `ceiling_age_seconds` inside the bound simply
+            # abstains like any other unproven case.
+            if (
+                self.age_bound_seconds > 0
+                and ceiling_anchored
+                and ceiling_age_seconds is not None
+                and ceiling_age_seconds > self.age_bound_seconds
+            ):
+                return AgentTaskEvidence(
+                    closure_status="interrupted",
+                    closed_by="ageBounded",
+                    end_time_ms=int(current_ms - ceiling_age_seconds * 1000),
+                    agent_status="interrupted",
+                )
             return None
         if not info.path_known:
             return None
@@ -381,6 +555,43 @@ class ClaudeSubagentOracle:
                 closure_status="interrupted",
                 closed_by="agentFileStale",
                 end_time_ms=info.mtime_ms,
+                agent_status="interrupted",
+            )
+        # T2 (stale-residue-selfheal): the age ceiling. The file still looks
+        # fresh, but the task's newest launch/survival evidence is older than
+        # any legitimate run — with no live signal, the file's freshness is
+        # what this rule declines to trust, and the card closes. `attached`
+        # has already returned above (after its own F2 pierce); the explicit
+        # guard is kept so the exemption holds even if this branch is ever
+        # re-ordered.
+        #
+        # The ceiling is the one judgement that reads an age at all, so it is
+        # also the one that must not read a *polluted* one (R1c): it judges on
+        # `ceiling_age_seconds`, the anchor that came from the raw transcript
+        # alone — no free-text supplement, no mention from either surface. A
+        # newer bogus anchor can only ever DEFERR this closure, so a session
+        # that keeps writing could hold a dead card open forever while every
+        # other rule finds it fresh; the never-started grace and the F4
+        # arbitration below keep the combined anchor, where a newer anchor is
+        # the harmless direction. A caller with no separate ceiling anchor
+        # falls back to the receipt age, so the ceiling is never unreachable.
+        ceiling_age = (
+            ceiling_age_seconds if ceiling_anchored else receipt_age_seconds
+        )
+        if (
+            not attached_live
+            and self.age_bound_seconds > 0
+            and ceiling_age is not None
+            and ceiling_age > self.age_bound_seconds
+        ):
+            return AgentTaskEvidence(
+                closure_status="interrupted",
+                closed_by="ageBounded",
+                # The newest survival evidence is the anchor (the same one
+                # the never-started rule ends on, F2b): the file's freshness
+                # is exactly what this branch distrusts, so the mtime is not
+                # the honest "ended at".
+                end_time_ms=int(current_ms - ceiling_age * 1000),
                 agent_status="interrupted",
             )
         return None
@@ -497,12 +708,14 @@ class RawTranscriptScan:
     """What one transcript's raw lines say about Agent tasks."""
 
     notices: tuple[RawTranscriptNotice, ...]
-    #: task_id -> epoch ms of the newest ``agentId: <id>`` mention in the
+    #: task_id -> epoch ms of the newest ``agentId: <id>`` receipt in the
     #: transcript. The CLI writes that receipt when an Agent call is
     #: dispatched, so it is the closest thing the transcript has to a launch
     #: time — the input the never-started grace needs (F5). The SDK message
     #: view exposes no timestamps at all, which is why this comes from the raw
-    #: file.
+    #: file. Rows are admitted by SHAPE (a ``user`` row carrying a
+    #: ``tool_result`` block), not by the substring: a row that only quotes
+    #: ``agentId:`` never gets in (R1c), because a mention is not a receipt.
     receipt_times_ms: Mapping[str, int] = field(default_factory=dict)
     #: SendMessage tool_use id -> the task id that call addresses. This is the
     #: persisted copy of the live projector's in-process alias map, so a
@@ -543,6 +756,15 @@ class RawTranscriptScan:
     #: mapping alone (red team F2/F3: a hand-built or polluted mapping must not
     #: be able to mint phantom cards or steer a fold onto a quoting tool id).
     verified_dispatch_ids: frozenset[str] = frozenset()
+    #: Row uuid -> its 0-based line in ``raw_lines``. Built in the same pass as
+    #: everything above (the scan already parses every uuid-bearing row), it is
+    #: what lets ``raw_only_notices`` compare a notice's own position against
+    #: the row a stored cursor stopped at: the message view never surfaces a
+    #: ``queue-operation`` notice, so the only way to tell a notice written
+    #: *after* the cursor from one written before it is in the raw file's own
+    #: line order (D-B, zombie-agent-card §9). Empty for hand-built scans,
+    #: which then keep the window gate exactly as it was.
+    uuid_line_index: Mapping[str, int] = field(default_factory=dict)
 
 
 def scan_raw_transcript(
@@ -564,11 +786,23 @@ def scan_raw_transcript(
 
     ``attachment`` rows repeat the same wrapper as rendering chrome and are
     skipped. The same pass also collects each task's newest ``agentId:``
-    mention (its dispatch receipt time), each task's newest ``SendMessage``
+    receipt (its dispatch receipt time), each task's newest ``SendMessage``
     resume-call row time (its newest survival evidence, P9), and the lineage
     the resume fold needs (alias-durability-tasks T1 A): the SendMessage alias
     map, the dispatch roots, and the provenance set that gates both, so
     callers get every fact for one read of the file.
+
+    Receipt times are read by the row's SHAPE, not by the substring (R1c): a
+    ``user`` row — carrying a ``tool_result`` block, the row-level
+    ``toolUseResult`` variant, or the bare body F5 pinned — is the engine's
+    answer to a dispatch call, while an ``assistant`` row that merely contains
+    ``agentId:`` is quoting one. Both are found by the same substring, and only
+    one of them is evidence of a launch: the quoting shape is what let an
+    assistant's sentence re-stamp a dead task's launch anchor and defer the age
+    ceiling indefinitely. The gate here is deliberately weaker than the lineage
+    gate below, which also demands the acknowledged call's *name* because it
+    mints a root — F5's bare result, whose call row was trimmed away, must
+    still date its task.
 
     Both lineage maps are **provenance-gated** (red team F1): a ``tool_result``
     row only counts as a dispatch receipt when the call it acknowledges is an
@@ -591,6 +825,7 @@ def scan_raw_transcript(
     dispatch_roots: dict[str, set[str]] = {}
     tool_use_names: dict[str, str] = {}
     last_anchor: str | None = None
+    uuid_line_index: dict[str, int] = {}
     for line_index, line in enumerate(raw_lines):
         wants_notice = "<task-notification>" in line
         wants_receipt = "agentId:" in line
@@ -618,6 +853,10 @@ def scan_raw_transcript(
         row_uuid = _string(row.get("uuid"))
         if row_uuid is not None:
             last_anchor = row_uuid
+            # Keep the FIRST line a uuid appears on: a resumed/rewritten file
+            # can repeat a row, and the earlier position is the honest order
+            # for the window gate (D-B). `setdefault` is the whole rule.
+            uuid_line_index.setdefault(row_uuid, line_index)
         if wants_tool_use:
             _register_tool_use_names(row, tool_use_names)
         if wants_receipt or wants_send or wants_resume or wants_agent_key:
@@ -639,7 +878,18 @@ def scan_raw_transcript(
         if not wants_notice and not wants_receipt:
             continue
         timestamp_ms = _parse_iso_ms(row.get("timestamp"))
-        if wants_receipt and timestamp_ms is not None:
+        # R1c: a receipt is admitted by the SHAPE of the row, not by the
+        # substring. The CLI writes the launch receipt as the ``tool_result``
+        # that answers the dispatch call, so a row of that shape is a receipt
+        # whatever it says (F5's bare result, whose call row may be trimmed, is
+        # still a receipt and must survive); a row that merely *contains*
+        # ``agentId:`` — an assistant quoting a run, a report about another
+        # agent, a grep/cat of a transcript — is not, and letting it in let any
+        # sentence re-stamp a dead task's launch anchor. Same shape test the
+        # notice branch below applies to its own rows, and strictly weaker than
+        # the lineage gate: that one also demands the acknowledged call's name,
+        # because it mints a root, while this only dates a mention.
+        if wants_receipt and timestamp_ms is not None and _is_receipt_row(row):
             for match in _AGENT_ID_RE.finditer(line):
                 task_id = match.group(1)
                 if (receipt_times.get(task_id) or -1) < timestamp_ms:
@@ -694,10 +944,111 @@ def scan_raw_transcript(
             if roots
         },
         verified_dispatch_ids=verified_dispatch_ids,
+        uuid_line_index=uuid_line_index,
     )
 
 
 _AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-zA-Z]+)")
+
+
+def _is_receipt_row(row: Mapping[str, Any]) -> bool:
+    """Whether this raw row has the shape a dispatch receipt is written in.
+
+    Receipts arrive on a ``user`` row, in either of the two shapes the CLI has
+    written them in: a ``tool_result`` block (with the row-level
+    ``toolUseResult`` variant), or the bare body of the user row itself — the
+    form F5 pinned, whose dispatch call row the transcript may no longer hold
+    and which is the reason the message-view supplement exists at all. Both are
+    the engine's own channel.
+
+    An ``assistant`` row is not one of those shapes and never was: that is where
+    free text lives, so a line that merely *mentions* ``agentId:`` there is a
+    sentence about a run, not the engine's answer to a dispatch call. Dropping
+    that shape is what R1c needed; the two receipt shapes above are kept whole.
+
+    The bare body is the shape the HUMAN writes on a ``user`` row too — a typed
+    message, hook output, a pasted command result — so the row type alone
+    cannot admit it without re-opening the pollution this gate exists to close
+    one row-type over (R4-2: a human message quoting the id re-stamped a dead
+    task's launch anchor through exactly this branch). What separates the two
+    is the engine's own wording: every launch receipt opens with
+    ``ASYNC_AGENT_RECEIPT_PREFIX``. What the raw scan and the message view
+    share is that wording criterion, NOT the same boundary (R1e-3): every
+    message-view call site hands :func:`is_async_agent_receipt` a
+    *tool_result* channel and the fold additionally demands a known ``Agent``
+    call, while this scan reads the user row's own text with no call
+    requirement at all — so a human pasting the receipt wording verbatim is
+    admitted here where the message view has no channel that would. That
+    looseness is declared and accepted: no reliable marker separates the two
+    rows.
+    The ``tool_result`` block shape without metadata is deliberately NOT
+    gated on wording: the block type is the engine's channel there, and F5's
+    bare result — the form whose dispatch call row the transcript may no
+    longer hold — keeps its prefix clause instead of a lineage check, which
+    would kill it.
+
+    Where the row carries ``toolUseResult`` metadata, the metadata's mere
+    presence is not the test (R1e-2): the frame is judged by
+    :func:`is_async_agent_receipt` on that metadata with the row's own text
+    as the body — an explicit ``async_launched`` status is a launch receipt;
+    any other explicit status is the call's OUTCOME (a sync Agent call's
+    result frame is its card's done/failed, and the message view refuses the
+    very same metadata); a status-less frame falls back to the wording. A
+    row whose text cannot be read is refused when no explicit status speaks
+    for it (R1f-2): a status-less frame is not trusted on the metadata alone,
+    while an explicit ``async_launched`` admits without a body — the message
+    view judges that frame the same way.
+    """
+
+    if row.get("type") != "user":
+        return False
+    if isinstance(row.get("toolUseResult"), Mapping):
+        return is_async_agent_receipt(
+            row.get("toolUseResult"),
+            output=_receipt_row_body_text(row),
+        )
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, str):
+        # The bare F5 body: the receipt IS the user row's content — admitted
+        # only when the body carries the engine's launch wording (R4-2). The
+        # metadata channel is absent by construction here (that is the other
+        # branch above), so the body has to speak, exactly as
+        # `is_async_agent_receipt` reads it in the message view.
+        return is_async_agent_receipt(None, output=content)
+    return isinstance(content, list) and any(
+        isinstance(block, Mapping) and block.get("type") == "tool_result"
+        for block in content
+    )
+
+
+def _receipt_row_body_text(row: Mapping[str, Any]) -> str | None:
+    """The text of the row's own content, for the wording judgment.
+
+    The raw scan's counterpart of the text the message view hands to
+    :func:`is_async_agent_receipt` as the tool_result's body: a bare string
+    content reads as itself, a ``tool_result`` block as its text parts. Only
+    ``tool_result`` blocks are read, which is narrower than the message
+    view's own extraction (that one reads any block's ``text``): a
+    text-typed frame is refused here where the view could read it (R1f-1,
+    recorded — the refusal only ever delays a closure, and the CLI writes
+    receipts as bare strings or ``tool_result`` blocks, not text-typed
+    frames). ``None`` when no text can be read this way — a status-less row
+    is then refused rather than trusted on the metadata alone.
+    """
+
+    message = row.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "tool_result":
+            continue
+        texts.extend(_tool_result_texts(block.get("content")))
+    return "\n".join(texts) if texts else None
 
 
 def _register_tool_use_names(
@@ -897,6 +1248,7 @@ def raw_only_notices(
     scan: RawTranscriptScan,
     *,
     sdk_uuid_order: Mapping[str, int],
+    window_origin_uuid: str | None = None,
 ) -> tuple[tuple[int, ClaudeTaskEvent], ...]:
     """The ``(placement_index, event)`` of the raw notices the SDK dropped.
 
@@ -919,15 +1271,51 @@ def raw_only_notices(
     by the transcript's real order. A notice with no anchor at all — no uuid on
     its row and none before it — cannot be located and is declined.
 
+    ``window_origin_uuid`` (D-B, zombie-agent-card §9) is the incremental
+    cursor's own last-message uuid: the row the previous projection stopped at.
+    A raw notice carries no uuid of its own, so its anchor is the *last uuid row
+    before it* — which, for a notice the CLI appended after a covered row, is a
+    row the SDK view already surfaced. Such a notice then failed
+    ``anchor not in sdk_uuid_order`` and was dropped even though it sits *after*
+    the cursor and belongs to this projection: the s7 shape, where a completion
+    notice written after the cursor never reached the fold and the card stayed
+    running until the 24h floor. The origin is the discriminator the SDK view
+    cannot give (it never surfaces a notice), so it is read from the raw file's
+    own line order: a notice whose anchor line is at or before the origin's line
+    was already covered by an earlier window and stays dropped; one after it is
+    admitted. Without an origin (a rebase, a first sync, a full snapshot — no
+    incremental boundary to compare against) the gate is byte-identical to
+    before, so those passes keep folding exactly the notices they always did.
+
     One signal per task is kept (the newest by timestamp), since two placements
     for one task would only add an ambiguous tie.
     """
 
+    origin_line: int | None = None
+    if window_origin_uuid is not None:
+        origin_line = scan.uuid_line_index.get(window_origin_uuid)
     newest_by_task: dict[str, RawTranscriptNotice] = {}
     for notice in scan.notices:
         if notice.row_uuid is not None and notice.row_uuid in sdk_uuid_order:
             continue
-        if notice.anchor is None or notice.anchor not in sdk_uuid_order:
+        anchor_in_window = (
+            notice.anchor is not None and notice.anchor in sdk_uuid_order
+        )
+        if not anchor_in_window:
+            # Raw-only and unplaceable by the SDK view. Only an explicit window
+            # origin may admit it, and only when its own raw line sits strictly
+            # after the origin's — i.e. the notice was written into this
+            # projection, not an earlier one. The origin is a row the cursor
+            # covered, so the notice's ANCHOR (the last uuid row before it) can
+            # be that very covered row; the notice's own line is what proves it
+            # came after.
+            if origin_line is not None and notice.line_index > origin_line:
+                task_id = notice.event.task_id
+                current = newest_by_task.get(task_id)
+                if current is None or (notice.timestamp_ms or -1) >= (
+                    current.timestamp_ms or -1
+                ):
+                    newest_by_task[task_id] = notice
             continue
         task_id = notice.event.task_id
         current = newest_by_task.get(task_id)
@@ -935,11 +1323,19 @@ def raw_only_notices(
             current.timestamp_ms or -1
         ):
             newest_by_task[task_id] = notice
-    return tuple(
-        (sdk_uuid_order[notice.anchor], notice.event)
-        for notice in newest_by_task.values()
-        if notice.anchor is not None
-    )
+    placed: list[tuple[int, ClaudeTaskEvent]] = []
+    for notice in newest_by_task.values():
+        if notice.anchor is None:
+            continue
+        if notice.anchor in sdk_uuid_order:
+            placed.append((sdk_uuid_order[notice.anchor], notice.event))
+        else:
+            # A window-origin admission is not in the SDK view: it is placed
+            # before every window signal (-1) so a resume/activity row *inside*
+            # the window still outranks it — the only safe order for a notice
+            # this projection cannot locate among its own messages.
+            placed.append((-1, notice.event))
+    return tuple(placed)
 
 
 def participation_times_ms(scan: RawTranscriptScan) -> dict[str, int]:
@@ -961,6 +1357,57 @@ def participation_times_ms(scan: RawTranscriptScan) -> dict[str, int]:
         if current is None or time_ms > current:
             merged[task_id] = time_ms
     return merged
+
+
+def verified_dispatch_tasks(scan: RawTranscriptScan) -> frozenset[str]:
+    """The tasks whose dispatch receipt the scan can attribute to a real call.
+
+    ``dispatch_roots`` is already sealed to ``verified_dispatch_ids`` by the
+    scan, so a non-empty root set *is* the intersection; it is recomputed here
+    explicitly because the consumer's decision is "may this anchor be
+    overruled?", and a decision that turns on an invariant living three files
+    away should say which invariant it means.
+
+    A task outside this set still has a receipt time — a bare ``tool_result``
+    whose dispatch row the transcript no longer holds is F5's whole reason the
+    supplement exists — but nothing ties it to a call, so a free-text mention
+    newer than it may overrule it (R1c R3-2).
+    """
+
+    verified = scan.verified_dispatch_ids
+    return frozenset(
+        task_id
+        for task_id, roots in scan.dispatch_roots.items()
+        if roots & verified
+    )
+
+
+def participation_ages_seconds(
+    scan: RawTranscriptScan | None,
+    *,
+    now_ms: int,
+) -> dict[str, float]:
+    """Every task's age from the raw transcript ALONE (R1c).
+
+    This is the age ceiling's anchor, kept apart from the age the other rules
+    judge on for exactly one reason: the others consume a free-text supplement
+    (F5's bare ``tool_result``, which the raw file may not have), and that
+    supplement is also the shape a quote takes. A mention that only *says*
+    ``agentId:`` can move this anchor in both directions — and for a ceiling,
+    moving it later defers the closure without bound, while every other rule
+    that would otherwise reach the card finds a fresh file.
+
+    So the ceiling reads this, and only this. A task the raw transcript has
+    nothing for gets no age and therefore no ceiling closure; the server-side
+    age janitor is the floor under that shape, not this rule's job to guess.
+    """
+
+    if scan is None:
+        return {}
+    return {
+        task_id: max((now_ms - time_ms) / 1000.0, 0.0)
+        for task_id, time_ms in participation_times_ms(scan).items()
+    }
 
 
 def participation_age_seconds(

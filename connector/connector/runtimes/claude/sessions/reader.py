@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Self
 
 import asyncer
 
@@ -58,9 +58,11 @@ from connector.runtimes.claude.sessions.subagent_oracle import (
     RawTranscriptScan,
     claude_project_key,
     claude_projects_dir,
+    participation_times_ms,
     raw_only_notices,
     scan_raw_transcript,
     scan_transcript_file,
+    verified_dispatch_tasks,
 )
 from connector.runtimes.claude.sessions.sync_state import ClaudeSessionSyncStateStore
 from connector.runtimes.claude.timeline.agent_calls import (
@@ -94,6 +96,77 @@ from connector.runtimes.claude.timeline.messages import (
 UNRESOLVED_LIVE_HISTORY_IMPORT_TTL_SECONDS = 120.0
 
 
+class SessionListPage(tuple):
+    """A `list_sessions` result that also says what it really read.
+
+    A plain tuple subclass, so every consumer that already iterates, indexes,
+    counts or unpacks these results is untouched — what changes is that an
+    empty result can finally be *interpreted*. The library rotation sweep
+    (task sheet §3 T1) walks the library one window per cycle and used to
+    read "empty window" as "end of the library", which is two different
+    things wearing the same value (R1 P1-2):
+
+    * a window the SDK never returned, because the read raised — reported
+      here as `read_failed`, so the ladder can skip and retry it later
+      instead of ending the sweep on it;
+    * a window whose sessions were all dropped by the live/active filters —
+      reported here as `history_scanned` larger than the page length, so the
+      ladder knows the library continues past it.
+
+    `history_scanned` also carries the page-one seam: how many history
+    sessions the first page actually exposed. Page 1 is merged with the
+    local overlay and then truncated, so local-only sessions push the tail of
+    `history[0:limit]` out of the page entirely; those displaced sessions are
+    in no window either, which is a coverage hole the ladder starts after the
+    seam instead of at a fixed page boundary.
+
+    `page_one_complete` is the first page's own verdict that it covers the
+    ENTIRE library (task sheet §3 T1b): the history list read whole (fewer
+    rows than the page size, so the SDK hit the end of the list rather than a
+    page boundary) with every session it named represented on the merged
+    page. A library that small can never prove its end from a window — every
+    window past the seam is legitimately empty and an empty window is not
+    proof (R1 P1-2/P1-3) — so without this verdict the sweep would read one
+    empty window per cycle forever. Only the first page can report it; a
+    paged window always leaves it False.
+    """
+
+    # No `__slots__`: a variable-length builtin like tuple refuses them, and a
+    # per-page dict costs nothing at one page per cycle.
+    def __new__(
+        cls,
+        sessions: tuple[SessionMeta, ...] = (),
+        *,
+        history_scanned: int | None = None,
+        read_failed: bool = False,
+        page_one_complete: bool = False,
+    ) -> Self:
+        page = super().__new__(cls, sessions)
+        page.history_scanned = (
+            len(page) if history_scanned is None else history_scanned
+        )
+        page.read_failed = read_failed
+        page.page_one_complete = page_one_complete
+        return page
+
+    def rescanned(self, sessions: tuple[SessionMeta, ...]) -> SessionListPage:
+        """The same read's sessions after filtering/truncation, flags intact.
+
+        This is also the protocol the re-pager in `runtime_protocol` looks for
+        by name (R1c): a page type MAY expose a callable ``rescanned`` to say
+        "here are my flags on a re-wrapped page", and one that does not is left
+        as the plain tuple it always was. It is a protocol, not a method every
+        runtime has to implement — `runtime_protocol` cannot import a runtime's
+        reader, so the name is the whole contract."""
+
+        return SessionListPage(
+            sessions,
+            history_scanned=self.history_scanned,
+            read_failed=self.read_failed,
+            page_one_complete=self.page_one_complete,
+        )
+
+
 @dataclass(slots=True)
 class ClaudeSessionReader:
     config: RuntimeConfig
@@ -115,23 +188,60 @@ class ClaudeSessionReader:
         limit: int = 100,
         cursor: str | None = None,
         force: bool = False,
-    ) -> tuple[SessionMeta, ...]:
-        local_sessions = self.session_store.list_sessions(limit=limit)
-        history_sessions = await self._list_history_sessions(
+    ) -> SessionListPage:
+        # Kept separate from the filtered list below: the page's flags
+        # describe the READ, and the filters must not erase them.
+        history_page = await self._list_history_sessions(
             limit=limit,
             cursor=cursor,
             force=force,
         )
         history_sessions = _filter_history_sessions_for_unresolved_live_sessions(
             runtime_sessions=self.session_store.sessions(),
-            local_sessions=local_sessions,
-            history_sessions=history_sessions,
+            local_sessions=self.session_store.list_sessions(limit=limit),
+            history_sessions=history_page,
         )
         history_sessions = _filter_history_sessions_for_active_local_sessions(
             runtime_sessions=self.session_store.sessions(),
             history_sessions=history_sessions,
         )
-        return _merge_session_metas(local_sessions, history_sessions)[:limit]
+        if cursor is not None:
+            # A paged window — any explicit cursor, including 0, where the
+            # ladder starts when page 1 displaced its whole exposed range
+            # (T1b) — is the library-coverage window (the rotating scan that
+            # reaches sessions beyond the first page). The local overlay is
+            # liveness freshness and belongs to page 1, which is fetched
+            # unchanged every cycle: merging it into a paged window would pull
+            # page-1 sessions up and then `[:limit]` would cut the tail of the
+            # window — dropping exactly the sessions a coverage sweep exists to
+            # reach. A paged window is therefore the raw history window, still
+            # guarded by the live/active filters above so an actively driven
+            # session is never rebuilt behind the live writer.
+            return history_page.rescanned(history_sessions[:limit])
+        local_sessions = self.session_store.list_sessions(limit=limit)
+        merged = _merge_session_metas(local_sessions, history_sessions)[:limit]
+        # Page 1's seam: the merged prefix is sorted by ordering time, so the
+        # history sessions that survived truncation are exactly a prefix of the
+        # history list. Count them so the rotation ladder can start past them.
+        return SessionListPage(
+            merged,
+            history_scanned=_history_seam_for_page_one(
+                merged,
+                local_sessions=local_sessions,
+            ),
+            # A failed history read must reach the page-1 result too: the
+            # merged page then holds local-only sessions (or nothing), and
+            # without this flag a seam of 0 would be indistinguishable from
+            # "the whole exposed history was displaced" (T1b) — which starts
+            # the ladder at a position the failed read never proved.
+            read_failed=history_page.read_failed,
+            page_one_complete=_page_one_covers_library(
+                merged_page=merged,
+                history_page=history_page,
+                history_sessions=history_sessions,
+                limit=limit,
+            ),
+        )
 
     async def get_session_state(
         self,
@@ -193,7 +303,7 @@ class ClaudeSessionReader:
         limit: int,
         cursor: str | None,
         force: bool,
-    ) -> tuple[SessionMeta, ...]:
+    ) -> SessionListPage:
         try:
             sdk = load_sdk(self.sdk_loader)
             sdk_sessions = await list_sdk_sessions(
@@ -202,8 +312,11 @@ class ClaudeSessionReader:
                 offset=_cursor_offset(cursor),
             )
         except Exception:  # noqa: BLE001
+            # The read did not happen. Say so (R1 P1-2): returning a bare `()`
+            # here is indistinguishable from an empty library, and a caller
+            # that walks windows would read a failed read as "past the end".
             logger.exception("Claude history session list failed")
-            return ()
+            return SessionListPage((), history_scanned=0, read_failed=True)
 
         metas: list[SessionMeta] = []
         for sdk_session in sdk_sessions:
@@ -217,7 +330,16 @@ class ClaudeSessionReader:
                     force=force,
                 )
             )
-        return tuple(metas)
+        # `history_scanned` is the count BEFORE the live/active filters below,
+        # which is what makes "this window was emptied by filtering" visible —
+        # and before the id-extraction skip above, which is what makes "the SDK
+        # filled this window but not one row carried an id we can key on"
+        # visible. Counting `metas` here reported the *survivors* of both
+        # filters, so a window the SDK really filled could reach the ladder as
+        # `history_scanned == 0`: byte-identical to "a clean read proved the
+        # library ends here", with a hundred unreadable sessions sitting past
+        # it (R1b R2-3).
+        return SessionListPage(tuple(metas), history_scanned=len(sdk_sessions))
 
     async def _session_meta_from_sdk_session(
         self,
@@ -285,6 +407,12 @@ class ClaudeSessionReader:
                     "requires_timeline_sync": requires_timeline_sync,
                     "history_cursor_missing": previous_cursor is None,
                     "previous_marker": previous_marker,
+                    # Whether the stored cursor was produced by an older
+                    # projection (or is missing entirely). This is the natural
+                    # signal a projection version bump leaves behind, and the
+                    # connector's library-scan rotation reads it to decide when
+                    # old sessions need a rebuild pass.
+                    "projection_outdated": projection_outdated,
                 },
                 "sdk": _sdk_session_metadata(sdk_session),
             },
@@ -395,6 +523,7 @@ def _history_items_from_messages(
     raw_scan: RawTranscriptScan | None = None,
     oracle: ClaudeSubagentOracle | None = None,
     live_task_ids: frozenset[str] = frozenset(),
+    window_origin_uuid: str | None = None,
 ) -> tuple[RuntimeTimelineItem, ...]:
     """Project one transcript window into timeline items.
 
@@ -409,7 +538,9 @@ def _history_items_from_messages(
     )
     if raw_scan is None and raw_lines:
         raw_scan = scan_raw_transcript(raw_lines)
-    raw_notices = _raw_history_notices(messages, raw_scan)
+    raw_notices = _raw_history_notices(
+        messages, raw_scan, window_origin_uuid=window_origin_uuid
+    )
     notification_folds = _agent_task_notification_folds(
         session,
         messages,
@@ -513,12 +644,32 @@ def _history_items_from_messages(
     resequenced = _resequence_history_items(_dedupe_history_items(items))
     if oracle is None:
         return resequenced
+    raw_participation = participation_times_ms(raw_scan) if raw_scan else {}
     return _apply_oracle_closures(
         session,
         resequenced,
         messages=messages,
         raw_notices=raw_notices,
-        raw_receipt_times=(raw_scan.receipt_times_ms if raw_scan else {}),
+        # R1 P1-1: the newest survival evidence, not the dispatch receipt alone.
+        # A SendMessage resume leaves the receipt sitting at the original
+        # dispatch, so anchoring there makes the history rebuild close a task
+        # that was re-driven five minutes ago (the P9 false close the live
+        # sweep already avoids). `participation_times_ms` is the live side's
+        # own helper, so both sides now judge the same engine facts the same
+        # way, and the anchor only ever moves newer — the conservative
+        # direction for a ceiling.
+        raw_receipt_times=raw_participation,
+        # R1c R3-2: which of those anchors the scan can tie to a real dispatch
+        # call. Only those keep the fold from overruling them with the message
+        # view; a bare `tool_result` anchor (F5) is still an anchor, it just is
+        # not the engine's word about which call it answered.
+        verified_dispatch_roots=(
+            verified_dispatch_tasks(raw_scan) if raw_scan else frozenset()
+        ),
+        # ...and the ceiling reads the raw transcript's own times, with no
+        # message-view supplement at all: for a hard closure a newer mention
+        # from free text is not a tie to be broken, it is the closure deferred.
+        raw_ceiling_times=raw_participation,
         oracle=oracle,
         live_task_ids=live_task_ids,
     )
@@ -531,6 +682,8 @@ def _apply_oracle_closures(
     messages: tuple[Any, ...],
     raw_notices: tuple[tuple[int, ClaudeTaskEvent], ...],
     raw_receipt_times: Mapping[str, int] | None = None,
+    verified_dispatch_roots: frozenset[str] = frozenset(),
+    raw_ceiling_times: Mapping[str, int] | None = None,
     oracle: ClaudeSubagentOracle,
     now_ms: int | None = None,
     live_task_ids: frozenset[str] = frozenset(),
@@ -552,6 +705,20 @@ def _apply_oracle_closures(
         messages,
         now_ms=resolved_now_ms,
         raw_receipt_times=raw_receipt_times,
+        verified_dispatch_roots=verified_dispatch_roots,
+    )
+    # R1c: the ceiling's anchor, from the raw transcript alone. The age above is
+    # what the never-started grace and the F4 arbitration judge on; this is the
+    # age the hard ceiling judges on, because for that rule a newer bogus anchor
+    # is not a harmless tie — it defers the closure for as long as the session
+    # keeps being written.
+    ceiling_age_by_task = (
+        {
+            task_id: max((resolved_now_ms - time_ms) / 1000.0, 0.0)
+            for task_id, time_ms in raw_ceiling_times.items()
+        }
+        if raw_ceiling_times is not None
+        else None
     )
     closed: list[RuntimeTimelineItem] = []
     for item in items:
@@ -585,6 +752,7 @@ def _apply_oracle_closures(
                     session=session,
                     terminal_by_task=terminal_by_task,
                     receipt_age_by_task=receipt_age_by_task,
+                    ceiling_age_by_task=ceiling_age_by_task,
                     now_ms=resolved_now_ms,
                     live_task_ids=live_task_ids,
                 ).items()
@@ -631,6 +799,7 @@ def _apply_oracle_closures(
                 session=session,
                 terminal_by_task=terminal_by_task,
                 receipt_age_by_task=receipt_age_by_task,
+                ceiling_age_by_task=ceiling_age_by_task,
                 now_ms=resolved_now_ms,
                 live_task_ids=live_task_ids,
             )
@@ -680,7 +849,8 @@ def _card_oracle_verdicts(
     session: ClaudeSession,
     terminal_by_task: Mapping[str, tuple[int | None, ClaudeTaskEvent]],
     receipt_age_by_task: Mapping[str, float],
-    now_ms: int | None,
+    ceiling_age_by_task: Mapping[str, float] | None = None,
+    now_ms: int | None = None,
     live_task_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """One evidence verdict per judged task; declined tasks are absent.
@@ -690,6 +860,11 @@ def _card_oracle_verdicts(
     stale sibling's verdict. A task in that set is `attached` as well — the
     connector is driving its process — so even its own file silence cannot
     close it (a terminal notice still can).
+
+    ``ceiling_age_by_task`` is the age ceiling's own anchor (R1c): the one the
+    raw transcript vouches for, without the free-text supplement the other two
+    rules tolerate. A task it has no entry for gets no ceiling judgement rather
+    than a borrowed one.
     """
 
     verdicts: dict[str, Any] = {}
@@ -703,6 +878,8 @@ def _card_oracle_verdicts(
             cwd=session.cwd,
             terminal_events=(terminal,) if terminal is not None else (),
             receipt_age_seconds=receipt_age_by_task.get(task_id),
+            ceiling_age_seconds=(ceiling_age_by_task or {}).get(task_id),
+            ceiling_anchored=ceiling_age_by_task is not None,
             attached_live=task_id in live_task_ids,
             now_ms=now_ms,
         )
@@ -805,8 +982,9 @@ def _history_receipt_ages(
     *,
     now_ms: float,
     raw_receipt_times: Mapping[str, int] | None = None,
+    verified_dispatch_roots: frozenset[str] = frozenset(),
 ) -> dict[str, float]:
-    """The age (in seconds) of a task's newest agentId mention in the transcript.
+    """The age (in seconds) of a task's newest agentId receipt in the transcript.
 
     The CLI writes the receipt — with the task's ``agentId`` — into the
     transcript when the Agent call is dispatched (an ``async_launched`` launch
@@ -819,6 +997,25 @@ def _history_receipt_ages(
     message view is the supplement (F5): the SDK's messages carry no timestamps
     at all, so before this the age was unknowable and the never-started closure
     unreachable on real data.
+
+    Who wins when both surfaces have an anchor is decided by PROVENANCE, not by
+    order (R1c R3-2). A message is free text: an assistant can quote
+    ``agentId: <task>`` in a sentence about an old run without the task being
+    alive, and the fold used to take the newest mention per task, so one stray
+    sentence re-stamped the clock of a task that died a day ago. R1b closed that
+    by making the scanner absolute — which is one way too far, because the
+    scanner's anchor is not always the better evidence. Where the raw file has
+    only a bare ``tool_result`` (F5's shape, its call row trimmed away) nothing
+    ties that anchor to a call, and a genuinely newer receipt in the message
+    view was discarded in favour of a stale one: a task that launched five
+    minutes ago was closed on a 26-hour-old echo.
+
+    So a scanner anchor whose roots the scan verified against a real dispatch
+    call keeps it — that is the engine's own word, and the rule R1b wanted. Any
+    other scanner anchor yields to a strictly newer message-view receipt. Only
+    *newer* mentions displace one, so this can move an anchor later (deferring a
+    judgement, the direction that cannot lie about a live agent) and never
+    manufacture an older launch.
     """
 
     newest_ms: dict[str, int] = {
@@ -833,8 +1030,14 @@ def _history_receipt_ages(
             continue
         for match in _AGENT_ID_RE.finditer(text):
             task_id = match.group(1)
-            if (newest_ms.get(task_id) or -1) < time_ms:
-                newest_ms[task_id] = time_ms
+            current = newest_ms.get(task_id)
+            if current is not None and (
+                task_id in verified_dispatch_roots or time_ms <= current
+            ):
+                # The scanner's own verified receipt, or nothing newer to say:
+                # either way the anchor stands.
+                continue
+            newest_ms[task_id] = time_ms
     return {
         task_id: max((now_ms - time_ms) / 1000.0, 0.0)
         for task_id, time_ms in newest_ms.items()
@@ -1086,6 +1289,8 @@ def _read_raw_transcript_scan(session: ClaudeSession) -> RawTranscriptScan | Non
 def _raw_history_notices(
     messages: tuple[Any, ...],
     scan: RawTranscriptScan | None,
+    *,
+    window_origin_uuid: str | None = None,
 ) -> tuple[tuple[int, ClaudeTaskEvent], ...]:
     """Raw-only terminal notices the SDK view dropped, placed at their anchor.
 
@@ -1093,6 +1298,11 @@ def _raw_history_notices(
     behaves exactly as before. A notice participates only when its raw-file
     anchor resolves inside this window (see ``raw_only_notices``); it is folded
     at the anchor's index so the window's own later signals still win.
+
+    ``window_origin_uuid`` is the incremental cursor's last-message uuid, when
+    this projection is an incremental pass (D-B): the raw-only notices the
+    window cut off are admitted past it. A rebase / first sync / full snapshot
+    passes ``None`` and keeps the old gate exactly.
     """
 
     if scan is None or not scan.notices:
@@ -1109,7 +1319,11 @@ def _raw_history_notices(
             if isinstance(key, str) and key and key not in sdk_uuid_order:
                 sdk_uuid_order[key] = index
     try:
-        return raw_only_notices(scan, sdk_uuid_order=sdk_uuid_order)
+        return raw_only_notices(
+            scan,
+            sdk_uuid_order=sdk_uuid_order,
+            window_origin_uuid=window_origin_uuid,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Claude raw transcript notification scan failed")
         return ()
@@ -1334,6 +1548,107 @@ def _merge_duplicate_history_item(
     )
 
 
+def _history_seam_for_page_one(
+    merged_page: tuple[SessionMeta, ...],
+    *,
+    local_sessions: tuple[SessionMeta, ...],
+) -> int:
+    """How many history sessions page 1 actually exposed (R1 P2-6).
+
+    Page 1 is `(_merge(local, history))[:limit]`, and the merge sorts by
+    ordering time, so the history entries that survived truncation are the
+    first N of the history list. Every local-only session in the page pushes
+    one history entry off the end, and those displaced entries are in no
+    rotation window either — the sweep would step over them at every page
+    boundary. The ladder therefore starts at the seam (the first index page 1
+    did not expose) rather than at a fixed page multiple.
+
+    An entry counts as history-derived when no local session carries its id:
+    a session present in both was merged into one entry, which page 1
+    already covers under its local identity, so counting it as covered is
+    the conservative choice (the ladder may re-read it; it may not skip it).
+    """
+
+    if not local_sessions:
+        return len(merged_page)
+    local_ids = {
+        identifier
+        for session in local_sessions
+        for identifier in (session.session_id, session.external_session_id)
+        if identifier
+    }
+    return sum(
+        1
+        for session in merged_page
+        if session.session_id not in local_ids
+        and (
+            session.external_session_id is None
+            or session.external_session_id not in local_ids
+        )
+    )
+
+
+def _page_one_covers_library(
+    *,
+    merged_page: tuple[SessionMeta, ...],
+    history_page: SessionListPage,
+    history_sessions: tuple[SessionMeta, ...],
+    limit: int,
+) -> bool:
+    """Whether page 1 provably covers the entire library (T1b).
+
+    The rotation ladder walks window after window until a read proves where
+    the library ends. A library whose whole list fits inside the first page
+    can never prove that from a window — every window past the seam is
+    legitimately empty, and an empty window is not proof (R1 P1-2/P1-3) — so
+    the sweep would read one empty window per cycle forever. The page that
+    DOES cover such a library says so instead, on three conditions that
+    together make the claim sound:
+
+    * the history read succeeded (`read_failed` is False);
+    * the SDK returned fewer rows than the page size, so this read reached
+      the end of the list rather than a page boundary (a full window is
+      unprovable either way: the library may be exactly one page, or longer
+      — the residual the ladder still has to walk);
+    * every row the read returned was keyed (a row without an id cannot be
+      found on the page either) and every session this page would have
+      compared is on the merged page, claimed by session id or external id
+      — so a session merged with its local overlay counts as covered.
+
+    The checked list is the FILTERED history list. Sessions the live/active
+    filters dropped are excluded on purpose: a paged window applies the same
+    filters, so the sweep could never rebuild them either, and their own
+    sync paths (or page 1, once they settle) own them. Any session that was
+    displaced off the merged page is still checked — none of the conditions
+    above may be skipped, so the flag stays False exactly when the ladder
+    still has something to walk.
+    """
+
+    if history_page.read_failed:
+        return False
+    if history_page.history_scanned >= limit:
+        # The SDK filled the window: a full page is a page boundary, not the
+        # end of the library.
+        return False
+    if len(history_page) != history_page.history_scanned:
+        # Rows the reader could not key on are rows it cannot vouch for.
+        return False
+    covered = {
+        identifier
+        for session in merged_page
+        for identifier in (session.session_id, session.external_session_id)
+        if identifier
+    }
+    return all(
+        session.session_id in covered
+        or (
+            session.external_session_id is not None
+            and session.external_session_id in covered
+        )
+        for session in history_sessions
+    )
+
+
 def _merge_session_metas(
     local_sessions: tuple[SessionMeta, ...],
     history_sessions: tuple[SessionMeta, ...],
@@ -1467,6 +1782,24 @@ def _merge_session_meta(primary: SessionMeta, secondary: SessionMeta) -> Session
             "changed": (
                 primary_sync.get("changed") is True
                 or secondary_sync.get("changed") is True
+            ),
+            # The local overlay never carries this flag; the history side does.
+            # It must survive the merge exactly like the two above, or a session
+            # that is both live and history-backed would hide its outdated
+            # projection from the library sweep.
+            "projection_outdated": (
+                primary_sync.get("projection_outdated") is True
+                or secondary_sync.get("projection_outdated") is True
+            ),
+            # The history read is the only side that knows this flag, so a
+            # local overlay adopted for a history-only session (D-A,
+            # zombie-agent-card §9) must carry it through the merge rather
+            # than drop it — otherwise creating a store entry for such a
+            # session hides the cursor state the marker predicates read.
+            "history_cursor_missing": (
+                secondary_sync.get("history_cursor_missing")
+                if secondary.metadata.get("source") == "claude.session/list"
+                else primary_sync.get("history_cursor_missing")
             ),
         }
     return SessionMeta(
