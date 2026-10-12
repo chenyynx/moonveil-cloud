@@ -45,12 +45,6 @@ class LocalOps:
     async def read_dir(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self.files.read_dir(params)
 
-    async def resolve_path_entry(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self.files.resolve_path_entry(params)
-
-    async def list_files(self, params: dict[str, Any]) -> dict[str, Any]:
-        return await self.files.list_files(params)
-
     async def shell_exec(self, params: dict[str, Any]) -> dict[str, Any]:
         return await self.shell.exec(params)
 
