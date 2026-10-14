@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from agent_server.core.models import TimelineItem, TimelineItemIn
 
@@ -11,12 +13,18 @@ from agent_server.core.models import TimelineItem, TimelineItemIn
 class TimelineItemWriteResult:
     item: TimelineItem
     changed: bool
+    # Stable ids of rows this write removed (a converged live/history twin).
+    # A deletion has no surviving row to carry the change, so the publisher
+    # must express it explicitly — otherwise a client that already cached the
+    # removed id keeps rendering it until a full refetch.
+    deleted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class TimelineBatchWriteResult:
     items: tuple[TimelineItem, ...]
     changed: bool
+    deleted: tuple[str, ...] = ()
 
 
 def timeline_item_state_is_unchanged(
@@ -26,6 +34,30 @@ def timeline_item_state_is_unchanged(
     """Compare the Runtime-owned state identity for one stable item ID."""
 
     return existing.contentHash == incoming.contentHash
+
+
+def native_item_id_from_payload(payload_json: str) -> str | None:
+    """Extract ``source.itemId`` from a stored payload, or None.
+
+    The Runtime-native item id lives in the payload (``source.itemId``) but is
+    also mirrored to a column for indexed grouping; a row written before the
+    column existed (or by an older worker during a rolling upgrade) carries
+    NULL and is invisible to the corrector until refilled. A malformed payload,
+    or one without an itemId, yields None — such rows are genuinely out of
+    scope, not an error.
+    """
+
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return None
+    value = source.get("itemId")
+    return value if isinstance(value, str) and value else None
 
 
 def timeline_item_from_runtime_input(
@@ -144,3 +176,35 @@ def timeline_item_json_bytes(item: TimelineItem) -> int:
             default=str,
         ).encode("utf-8")
     )
+def timeline_item_content_hash(
+    *,
+    item_type: str,
+    status: str,
+    role: str | None,
+    content: Any,
+) -> str:
+    """Canonical state hash for one timeline item.
+
+    Mirrors the Runtime protocol's ``timeline_content_hash`` (connector
+    ``runtime_protocol/timeline.py``): a deterministic digest over the item's
+    own state. Any writer that derives a new state for an existing row (an
+    approval resolution, the age janitor) must recompute the hash, otherwise
+    the row carries a hash that no longer describes it and a later Runtime
+    push of the previous state would look unchanged on the no-op fast path
+    instead of superseding the derived state.
+    """
+
+    payload = {
+        "type": item_type,
+        "status": status,
+        "role": role,
+        "content": content,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()

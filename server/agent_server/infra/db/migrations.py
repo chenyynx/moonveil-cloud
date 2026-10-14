@@ -22,8 +22,8 @@ from agent_server.infra.db.engine import POSTGRES_BACKEND, resolve_db_url
 
 LEGACY_V1_REVISION = "v1_legacy"
 BASELINE_V2_REVISION = "v2_0"
-CURRENT_SCHEMA_REVISION = "v2_41"
-CURRENT_SCHEMA_VERSION = "2.41"
+CURRENT_SCHEMA_REVISION = "v2_42"
+CURRENT_SCHEMA_VERSION = "2.42"
 POSTGRES_MIGRATION_LOCK_ID = 0x414147454E545332
 DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 120.0
 
@@ -101,7 +101,18 @@ def postgres_migration_lock(
     errors: list[BaseException] = []
 
     async def hold() -> None:
-        engine = create_async_engine(db_url, poolclass=NullPool)
+        # The holder must never leave a transaction open. SQLAlchemy autobegins
+        # on the first statement, so without AUTOCOMMIT this connection sits
+        # ``idle in transaction`` (holding a snapshot) for the whole migration.
+        # A v2_42-style ``CREATE INDEX CONCURRENTLY`` runs on a different
+        # connection and waits for every transaction that can still see the
+        # table to finish — including this idle one, which only ends when the
+        # migration ends. That deadlocks the migration forever. Session-level
+        # advisory locks are independent of transactions, so autocommit keeps
+        # the mutual exclusion while releasing the snapshot.
+        engine = create_async_engine(
+            db_url, poolclass=NullPool, isolation_level="AUTOCOMMIT"
+        )
         try:
             async with engine.connect() as connection:
                 deadline = time.monotonic() + timeout_seconds

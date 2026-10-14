@@ -41,6 +41,28 @@ DEFAULT_LANE_CACHE_ITEMS = 1024
 DEFAULT_LANE_IDLE_SECONDS = 900.0
 DEFAULT_MAX_LANES = 4096
 
+# A snapshot replacement can omit thousands of rows at once. Listing every
+# removed id would bloat the realtime envelope (the broker splits events above
+# its byte threshold) for the sake of a client-side in-place drop; past this
+# count the envelope states only ``refetch``, which those clients already act
+# on. Small deletions — the converged-twin case this exists for — stay stated.
+MAX_STATED_DELETIONS = 200
+
+
+def _state_deletions(envelope: dict[str, Any], deleted: tuple[str, ...]) -> None:
+    """Record removed row ids on an outbound envelope.
+
+    A removed row has no surviving item to carry the change, so the envelope
+    always forces ``refetch`` — the signal today's clients act on. The ids
+    themselves are stated only while they are few enough to be a targeted
+    in-place drop rather than a payload; above ``MAX_STATED_DELETIONS`` a
+    client re-pulls anyway, so the array would only cost bytes.
+    """
+
+    envelope["refetch"] = True
+    if len(deleted) <= MAX_STATED_DELETIONS:
+        envelope["deleted"] = list(deleted)
+
 
 @dataclass(slots=True)
 class _PendingSnapshot:
@@ -203,9 +225,15 @@ class TimelineWriteBuffer:
         self._local_sources: dict[str, str] = {}
         self._local_mark_read: set[str] = set()
         self._local_dirty: set[str] = set()
-        self._active_session_fences: ContextVar[frozenset[str]] = ContextVar(
-            f"timeline-write-buffer-fences-{id(self)}",
-            default=frozenset(),
+        # Session id -> the task that currently holds the fence, so re-entrancy
+        # is scoped to the OWNING task. A child task that inherits this ContextVar
+        # must NOT be mistaken for the owner — it would otherwise skip the lane
+        # and Redis locks and the flush. None default keeps it cheap until used.
+        self._active_session_fences: ContextVar[dict[str, asyncio.Task[Any]] | None] = (
+            ContextVar(
+                f"timeline-write-buffer-fences-{id(self)}",
+                default=None,
+            )
         )
         self._sweeper_task: asyncio.Task[None] | None = None
         self._closing = False
@@ -439,14 +467,24 @@ class TimelineWriteBuffer:
     async def session_fence(self, session_id: str) -> AsyncIterator[None]:
         """Flush and exclude another accepted item for one stable operation."""
 
-        active_fences = self._active_session_fences.get()
-        if session_id in active_fences:
+        owners = self._active_session_fences.get() or {}
+        if owners.get(session_id) is asyncio.current_task():
+            # Same task re-entering its own fence: the lane lock, Redis lock,
+            # flush and floor are already held by the caller of this fence, so
+            # this is a no-op. A DIFFERENT task (e.g. a child spawned inside a
+            # fenced section, which inherits this ContextVar) is not the owner
+            # and must NOT take this path — it would silently skip the
+            # sealed-range guarantee. Such a child must be fire-and-forget: a
+            # parent that awaits a re-entering child WHILE still holding the
+            # fence would block on the lane/Redis lock it itself holds.
             yield
             return
 
         lane = await self._lane(session_id)
         async with lane.lock, self._sequences.session_fence(session_id):
-            token = self._active_session_fences.set(active_fences | {session_id})
+            token = self._active_session_fences.set(
+                {**owners, session_id: asyncio.current_task()}
+            )
             try:
                 try:
                     durable_before = await self._store.get_session_seq(session_id)
@@ -501,12 +539,15 @@ class TimelineWriteBuffer:
 
         durable_sequence = await self._store.get_session_seq(session_id)
         published_through = await self._sequences.published_head(session_id)
+        deleted = tuple(getattr(result, "deleted", ()) or ())
         if (
             isinstance(result, TimelineBatchWriteResult)
             and not result.changed
+            and not deleted
             and published_through is not None
             and published_through >= durable_sequence
         ):
+            # A no-op write with nothing removed has nothing to publish.
             return
         envelope: dict[str, Any] = {
             "sessionId": session_id,
@@ -517,6 +558,10 @@ class TimelineWriteBuffer:
             envelope["session"] = session.model_dump(mode="json")
         elif isinstance(result, TimelineItemWriteResult):
             envelope["items"] = [result.item.model_dump(mode="json")]
+            if deleted:
+                # A single-row writer states a surviving item but may also have
+                # removed a converged twin; nothing else carries that removal.
+                _state_deletions(envelope, deleted)
         elif isinstance(result, TimelineBatchWriteResult):
             result_items = list(result.items)
             needs_refetch = False
@@ -532,11 +577,24 @@ class TimelineWriteBuffer:
                 ]
             if operation == "replace_timeline_snapshot" and "items" in envelope:
                 envelope["timelineReset"] = True
+            if deleted and operation != "replace_timeline_snapshot":
+                # A batch writer that also removed rows (converged twins) must
+                # say so: nothing else in the envelope carries a removal, and
+                # today's client acts on ``refetch``, not on ``deleted``. A
+                # snapshot replacement is excluded — its ``deleted`` is just
+                # "rows the new snapshot omits", and the envelope already
+                # carries the complete new timeline via ``timelineReset`` +
+                # ``items`` (empty included). Forcing a refetch there would
+                # strand the client on the refetch path and suppress the empty
+                # ``timeline.snapshot`` the client needs to clear the view.
+                _state_deletions(envelope, deleted)
         else:
             session = await self._project_session_connector_status(
                 await self._store.get_session(session_id)
             )
             envelope["session"] = session.model_dump(mode="json")
+            if deleted:
+                _state_deletions(envelope, deleted)
         await self._broker.publish(session_id, envelope)
         await self._sequences.mark_published(session_id, durable_sequence)
 
@@ -560,20 +618,24 @@ class TimelineWriteBuffer:
             source_observed_at=snapshot.source_observed_at,
             mark_read_on_change=snapshot.mark_read_on_change,
         )
-        if result.items:
+        if result.items or result.deleted:
             next_seq = await self._store.get_session_seq(session_id)
             published_through = await self._sequences.published_head(session_id)
             if published_through is None or published_through < next_seq:
-                await self._broker.publish(
-                    session_id,
-                    {
-                        "sessionId": session_id,
-                        "nextSeq": next_seq,
-                        "items": [
-                            item.model_dump(mode="json") for item in result.items
-                        ],
-                    },
-                )
+                envelope: dict[str, Any] = {
+                    "sessionId": session_id,
+                    "nextSeq": next_seq,
+                }
+                if result.items:
+                    envelope["items"] = [
+                        item.model_dump(mode="json") for item in result.items
+                    ]
+                if result.deleted:
+                    # A converged twin's removal must reach the client: there is
+                    # no surviving item to carry it, so state the ids and force
+                    # the refetch the client acts on.
+                    _state_deletions(envelope, result.deleted)
+                await self._broker.publish(session_id, envelope)
                 await self._sequences.mark_published(session_id, next_seq)
             await publish_dashboard_changed(
                 self._store,
