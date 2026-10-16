@@ -42,7 +42,7 @@ from starlette.websockets import WebSocketDisconnect
 
 
 def make_client(tmp_path):
-    return make_test_client(tmp_path / "test.sqlite3")
+    return make_test_client()
 
 
 ADMIN_USER = "user1"
@@ -315,7 +315,6 @@ def session_view_for_assertions(
     )
     timeline_response.raise_for_status()
     timeline = timeline_response.json()
-    notices = []
     approvals = []
 
     return {
@@ -404,7 +403,7 @@ def _seed_running_runtime(
 
 
 def test_revoke_connector_rotates_token_and_disconnects(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     created = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -450,7 +449,11 @@ def test_revoke_connector_rotates_token_and_disconnects(tmp_path):
     assert new_auth.status_code == 200
 
 
-def wait_for(predicate, *, attempts: int = 20, interval: float = 0.01):
+def wait_for(predicate, *, attempts: int = 100, interval: float = 0.05):
+    # 5 s ceiling: the predicate polls the live server, and a shared-PostgreSQL
+    # test tick (mint → ingest → publish) can exceed the old 0.2 s window on a
+    # loaded box even though the state does arrive. Every caller waits for a
+    # thing to *appear*, so a longer window only removes false negatives.
     for _ in range(attempts):
         value = predicate()
         if value:
@@ -501,7 +504,7 @@ def wait_for_sessions_order(
 
 
 def test_platform_session_create_without_external_session_is_rejected(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -522,7 +525,7 @@ def test_platform_session_create_without_external_session_is_rejected(tmp_path):
 
 
 def test_session_create_does_not_persist_external_session_model_selection(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -554,7 +557,7 @@ def test_session_create_does_not_persist_external_session_model_selection(tmp_pa
 
 
 def test_session_create_does_not_persist_external_session_permission_selection(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -586,7 +589,7 @@ def test_session_create_does_not_persist_external_session_permission_selection(t
 
 
 def test_session_create_and_start_preallocates_session_and_passes_selections(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -778,7 +781,7 @@ def test_session_state_reads_runtime_status_over_stale_db_status(tmp_path):
 
 
 def test_session_create_rejects_legacy_runtime_settings_model_fields(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -805,7 +808,7 @@ def test_session_create_rejects_legacy_runtime_settings_model_fields(tmp_path):
 
 
 def test_claude_session_create_without_external_session_uses_create_and_start(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     connector_response = client.post("/connectors", headers=headers, json={"name": "dev"})
@@ -2732,7 +2735,7 @@ def test_terminal_ws_error_send_ignores_already_closed_socket():
 
 
 def test_connector_crud_updates_and_revokes_devices(tmp_path):
-    app = create_app(tmp_path / "test.sqlite3")
+    app = create_app()
     client = TestClient(app)
     headers = auth_headers(client)
     created = client.post("/connectors", headers=headers, json={"name": "dev"}).json()
@@ -5719,41 +5722,6 @@ def test_send_message_rejects_running_state(tmp_path):
     assert response.status_code == 409, response.text
     assert response.json()["detail"] == "session is running"
     assert not any(method == "session.send_message" for _, method, _, _ in fake_rpc.requests)
-
-
-@pytest.mark.skip(reason="legacy persisted notice behavior was removed; notices are runtime-owned live facts")
-def test_stored_execution_error_notice_does_not_override_runtime_send_capability(
-    tmp_path,
-):
-    client = make_client(tmp_path)
-    connector_id, _, session_id, headers = create_connector_and_session(client)
-    fake_rpc = FakeLocalRpc()
-    client.app.state.rpc = fake_rpc
-    asyncio.run(client.app.state.store.set_connector_status(connector_id, "online"))
-    client.post(f"/sessions/{session_id}/takeover", headers=headers).raise_for_status()
-    notice = asyncio.run(
-        upsert_execution_error_interaction(
-            client.app.state.store,
-            session_id=session_id,
-            error={"code": "runtime_error", "message": "boom"},
-        )
-    )
-
-    response = client.post(
-        f"/sessions/{session_id}/runtime/messages",
-        headers=headers,
-        json={"content": "try again"},
-    )
-
-    assert response.status_code == 200, response.text
-    turn_start_params = wait_for_rpc_method(fake_rpc, "session.send_message")[2]
-    assert turn_start_params["content"] == "try again"
-    assert asyncio.run(
-        client.app.state.store.get_notice(notice.noticeId)
-    ).status == "open"
-    snapshot = client.get(f"/sessions/{session_id}/snapshot", headers=headers)
-    assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["session"]["status"] == "idle"
 
 
 def test_send_message_forwards_uploaded_attachment_metadata_to_connector(tmp_path):
@@ -10605,7 +10573,16 @@ def test_timeline_sync_preserves_same_content_with_distinct_ids(tmp_path):
         ]
 
 
-def test_timeline_sync_preserves_distinct_ids_for_same_source_item(tmp_path):
+def test_timeline_sync_converges_one_message_onto_one_row(tmp_path):
+    """One logical message is one row: a live write and a history rebuild that
+    derive different ids but share ``source.itemId`` converge on the live id.
+
+    The live ``timeline.itemUpsert`` writes the message under its live id; the
+    later ``timeline.sync`` rebuild derives a different id (a ``derivedKey``
+    spelling) for the SAME native message. Storing both made the client render
+    the reply twice. The rebuild must instead update the live row in place.
+    """
+
     client = make_client(tmp_path)
     _, access_token, session_id, headers = create_connector_and_session(client)
     source = {
@@ -10667,14 +10644,16 @@ def test_timeline_sync_preserves_distinct_ids_for_same_source_item(tmp_path):
             json=sync_payload,
         )
         assert response.status_code == 200, response.text
-        receive_session_ws_event(ws, "timeline.item_created")
+        # The rebuild updates the canonical live row in place (revision 2 -> 3),
+        # so the push is an update, not a brand-new twin.
+        receive_session_ws_event(ws, "timeline.item_updated")
 
         state = session_view_for_assertions(client, session_id, headers)
         messages = [item for item in state["items"] if item["type"] == "message"]
-        assert [item["id"] for item in messages] == [
-            "tl_live_real_msg",
-            "tl_snapshot_real_msg",
-        ]
+        # Exactly one row for the native message, under the live id the client
+        # was already rendering; the snapshot's derived id never persists.
+        assert [item["id"] for item in messages] == ["tl_live_real_msg"]
+        assert messages[0]["content"]["text"] == "same answer"
         sequence_after_first_sync = asyncio.run(
             client.app.state.store.get_session_seq(session_id)
         )
@@ -10946,33 +10925,6 @@ def test_failed_approval_interaction_can_retry(tmp_path):
     assert notice.resolvedAt is not None
 
 
-@pytest.mark.skip(reason="legacy persisted notice behavior was removed; notices are runtime-owned live facts")
-def test_interaction_status_compare_and_set_rejects_stale_transition(tmp_path):
-    client = make_client(tmp_path)
-    _, _, session_id, _ = create_connector_and_session(client)
-    notice = asyncio.run(
-        upsert_execution_error_interaction(
-            client.app.state.store,
-            session_id=session_id,
-            error={"code": "runtime_error", "message": "boom"},
-        )
-    )
-    sequence_before = asyncio.run(client.app.state.store.get_session_seq(session_id))
-
-    with pytest.raises(ValueError, match="interaction status changed"):
-        asyncio.run(
-            client.app.state.store.update_notice_status(
-                notice.noticeId,
-                "resolved",
-                expected_status="failed",
-            )
-        )
-
-    current = asyncio.run(client.app.state.store.get_notice(notice.noticeId))
-    assert current.status == "open"
-    assert asyncio.run(client.app.state.store.get_session_seq(session_id)) == sequence_before
-
-
 def test_session_status_compare_and_set_rejects_stale_transition(tmp_path):
     client = make_client(tmp_path)
     _, _, session_id, _ = create_connector_and_session(client)
@@ -10990,31 +10942,6 @@ def test_session_status_compare_and_set_rejects_stale_transition(tmp_path):
     current = asyncio.run(client.app.state.store.get_session(session_id))
     assert current.status == "idle"
     assert asyncio.run(client.app.state.store.get_session_seq(session_id)) == sequence_before
-
-
-@pytest.mark.skip(reason="legacy persisted notice behavior was removed; notices are runtime-owned live facts")
-def test_session_stays_blocked_until_all_blocking_interactions_resolve(tmp_path):
-    client = make_client(tmp_path)
-    _, access_token, session_id, headers = create_connector_and_session(client)
-    ingest_pending_command_approval(client, access_token, session_id)
-    error_notice = asyncio.run(
-        upsert_execution_error_interaction(
-            client.app.state.store,
-            session_id=session_id,
-            error={"code": "runtime_error", "message": "boom"},
-        )
-    )
-
-    response = client.post(
-        f"/sessions/{session_id}/runtime/notices/{error_notice.noticeId}/respond",
-        headers=headers,
-        json={"actionId": "continue"},
-    )
-
-    assert response.status_code == 200, response.text
-    snapshot = client.get(f"/sessions/{session_id}/snapshot", headers=headers).json()
-    assert snapshot["session"]["status"] == "idle"
-    assert [notice["interactionType"] for notice in snapshot["notices"]] == ["approval"]
 
 
 def test_runtime_interruption_closes_pending_approval_tool_item(tmp_path):
@@ -12798,3 +12725,75 @@ def test_dashboard_snapshot_includes_projects_and_refreshes_after_create(tmp_pat
         session for session in refreshed["sessions"] if session["id"] == session_id
     )
     assert refreshed_session["projectId"] == existing_project_id
+
+
+def _order_preserving_item(item_id: str, session_id: str, order_seq: int) -> dict:
+    return {
+        "id": item_id,
+        "sessionId": session_id,
+        "type": "message",
+        "status": "done",
+        "role": "assistant",
+        "content": {"text": f"item {order_seq}", "format": "markdown"},
+        "source": {"runtime": "codex", "itemId": item_id},
+        "orderSeq": order_seq,
+        "revision": 1,
+        "contentHash": f"sha256:{item_id}",
+    }
+
+
+def test_timeline_endpoints_serialize_order_seq_end_to_end(tmp_path):
+    """Contract guard, route level: the wire JSON of both timeline routes must
+    carry `orderSeq` on every item.
+
+    The unit-level guard (``test_protocol_contracts.py``) dumps the response
+    *model* itself, so it cannot see a route that applies ``model_dump(exclude=
+    ...)`` on top. This one goes through the real HTTP endpoint and asserts on
+    the actual response bytes — closing that blind spot (red team round 3).
+    """
+    from agent_server.core.models import TimelineItemIn
+
+    client = make_client(tmp_path)
+    _, _, session_id, headers = create_connector_and_session(client)
+
+    async def seed_timeline_items() -> None:
+        store = client.app.state.store
+        for order_seq in range(1, 4):
+            await store.upsert_timeline_item(
+                session_id=session_id,
+                item=TimelineItemIn.model_validate(
+                    _order_preserving_item(f"tl_{order_seq}", session_id, order_seq)
+                ),
+            )
+
+    asyncio.run(seed_timeline_items())
+
+    # The required field set the contract pins for a timeline item.
+    required = {
+        "id",
+        "sessionId",
+        "type",
+        "status",
+        "source",
+        "orderSeq",
+        "contentHash",
+        "createdAt",
+        "updatedAt",
+        "updatedSeq",
+    }
+
+    timeline = client.get(f"/sessions/{session_id}/timeline", headers=headers)
+    assert timeline.status_code == 200, timeline.text
+    timeline_items = timeline.json()["items"]
+    assert timeline_items, "the timeline route must return the seeded items"
+    for item in timeline_items:
+        missing = required - set(item)
+        assert not missing, f"timeline route dropped {sorted(missing)}"
+
+    snapshot = client.get(f"/sessions/{session_id}/snapshot", headers=headers)
+    assert snapshot.status_code == 200, snapshot.text
+    snapshot_items = snapshot.json()["timeline"]["items"]
+    assert snapshot_items, "the snapshot route must return the seeded items"
+    for item in snapshot_items:
+        missing = required - set(item)
+        assert not missing, f"snapshot route dropped {sorted(missing)}"

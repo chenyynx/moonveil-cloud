@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections import deque
@@ -77,7 +78,6 @@ from agent_server.core.runtime_identity import (
     SessionRuntimeBindingError,
     resolve_session_runtime_binding,
 )
-from agent_server.core.timeline import timeline_item_json_bytes
 from agent_server.core.utc import utc_now
 from agent_server.deps import (
     current_user_id,
@@ -90,6 +90,7 @@ from agent_server.deps import (
     get_store,
     get_timeline_broker,
     get_timeline_write_buffer,
+    get_usage_recorder,
 )
 from agent_server.infra.connector_rpc import (
     ConnectorOfflineError,
@@ -121,6 +122,7 @@ from agent_server.services.session_meta_projection import (
 from agent_server.services.session_run import SessionRunError, SessionRunService
 from agent_server.services.session_runtime_state_cache import SessionRuntimeStateCache
 from agent_server.services.timeline_write_buffer import TimelineWriteBuffer
+from agent_server.services.usage_events import UsageRecorder
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -833,99 +835,32 @@ async def session_timeline(
     session_id: str,
     after_seq: int = Query(0, alias="afterSeq", ge=0),
     before_order_seq: int | None = Query(None, alias="beforeOrderSeq", ge=1),
-    mode: str = Query("latest", pattern="^(latest|changes|history|children)$"),
+    mode: str = Query("latest", pattern="^(latest|changes|history)$"),
     limit: int = Query(100, ge=1, le=500),
-    # Conversation view (session open coverage batch 2): drop the rows that
-    # belong to a subagent (``content.parentItemId`` set) so the window is
-    # spent on the conversation itself. Only the fixed string
-    # ``agent_children`` is accepted; any other value fails validation (422).
-    exclude: str | None = Query(None, pattern="^agent_children$"),
-    # The card whose own internal rows ``mode=children`` reads.
-    parent_id: str | None = Query(None, alias="parentId", min_length=1),
     user_id: str = Depends(current_user_id),
     db: Store = Depends(get_store),
     timeline_write_buffer: TimelineWriteBuffer = Depends(
         get_timeline_write_buffer
     ),
 ) -> ProtocolTimelineResponse:
-    exclude_agent_children = exclude is not None
-    if mode == "children":
-        if parent_id is None:
-            raise HTTPException(
-                status_code=422,
-                detail="parentId is required for children mode",
-            )
-        if exclude_agent_children:
-            raise HTTPException(
-                status_code=422,
-                detail="exclude is not supported with children mode",
-            )
-        if after_seq:
-            raise HTTPException(
-                status_code=422,
-                detail="afterSeq is not supported with children mode",
-            )
-    elif parent_id is not None:
-        raise HTTPException(
-            status_code=422,
-            detail="parentId is only supported with children mode",
-        )
-    if exclude_agent_children and mode == "changes":
-        # The live stream and recovery deltas stay complete (session open
-        # coverage batch 2): a running subagent's rows must arrive in real
-        # time, so the exclusion never applies to ``mode=changes``.
-        raise HTTPException(
-            status_code=422,
-            detail="exclude is not supported with changes mode",
-        )
     try:
         await db.get_session(session_id, user_id=user_id)
         async with timeline_write_buffer.session_fence(session_id):
             if mode == "latest":
-                if exclude_agent_children:
-                    items, has_more = (
-                        await db.list_timeline_latest_excluding_agent_children(
-                            session_id=session_id,
-                            limit=limit,
-                        )
-                    )
-                else:
-                    items, has_more = await db.list_timeline_latest(
-                        session_id=session_id,
-                        limit=limit,
-                    )
+                items, has_more = await db.list_timeline_latest(
+                    session_id=session_id,
+                    limit=limit,
+                )
             elif mode == "history":
                 if before_order_seq is None:
                     raise HTTPException(
                         status_code=422,
                         detail="beforeOrderSeq is required for history mode",
                     )
-                if exclude_agent_children:
-                    # The conversation-view page carries the count+byte double
-                    # gate. Without the exclusion parameter this read is
-                    # byte-for-byte the legacy one (no budget, no filtering):
-                    # the default request must not change behavior.
-                    items, has_more = (
-                        await db.list_timeline_before_order_seq_excluding_agent_children(
-                            session_id=session_id,
-                            before_order_seq=before_order_seq,
-                            limit=limit,
-                            byte_budget=_timeline_page_byte_budget(),
-                        )
-                    )
-                else:
-                    items, has_more = await db.list_timeline_before_order_seq(
-                        session_id=session_id,
-                        before_order_seq=before_order_seq,
-                        limit=limit,
-                    )
-            elif mode == "children":
-                items, has_more = await db.list_timeline_agent_children(
+                items, has_more = await db.list_timeline_before_order_seq(
                     session_id=session_id,
-                    parent_item_id=parent_id,
                     before_order_seq=before_order_seq,
                     limit=limit,
-                    byte_budget=_timeline_page_byte_budget(),
                 )
             else:
                 items, has_more = await db.list_timeline_since(
@@ -960,18 +895,6 @@ async def session_timeline(
 SNAPSHOT_TIMELINE_BYTE_BUDGET = 2 * 1024 * 1024
 SNAPSHOT_TIMELINE_BYTE_BUDGET_ENV = "AGENT_SERVER_SNAPSHOT_TIMELINE_BYTE_BUDGET"
 
-# Slow-network ceiling for one timeline *page* (raw bytes, before nginx gzip).
-# The count limit alone does not bound a page's size — a single Agent card or
-# tool row can carry tens of KB — so the conversation-view reads (history with
-# ``exclude=agent_children`` and ``mode=children``) also apply this page byte
-# budget, whichever of count/bytes trips first. Newest items are kept, the
-# oldest past the budget are dropped, and ``hasMore`` stays true so the
-# dropped range is reachable through the next page; at least one item is
-# always kept. Tunable via the AGENT_SERVER_TIMELINE_PAGE_BYTE_BUDGET
-# environment variable.
-TIMELINE_PAGE_BYTE_BUDGET = 1024 * 1024
-TIMELINE_PAGE_BYTE_BUDGET_ENV = "AGENT_SERVER_TIMELINE_PAGE_BYTE_BUDGET"
-
 
 def _snapshot_timeline_byte_budget() -> int:
     """Resolve the snapshot timeline byte budget, honouring the env override."""
@@ -984,27 +907,22 @@ def _snapshot_timeline_byte_budget() -> int:
     )
 
 
-def _timeline_page_byte_budget() -> int:
-    """Resolve the timeline page byte budget, honouring the env override."""
-
-    return int(
-        os.environ.get(
-            TIMELINE_PAGE_BYTE_BUDGET_ENV,
-            str(TIMELINE_PAGE_BYTE_BUDGET),
-        )
-    )
-
-
 def _snapshot_timeline_item_bytes(item: TimelineItem) -> int:
     """Byte size of one timeline item as the snapshot serializes it.
 
     The response is written as UTF-8 JSON with compact separators, so the byte
     budget measures that same encoding and cannot drift from the wire size.
-    Shared with the timeline page gate (``core.timeline.timeline_item_json_bytes``)
-    so the two budgets always measure the same metric.
+    Mirrors ``event_recovery._serialized_payload_bytes``.
     """
 
-    return timeline_item_json_bytes(item)
+    return len(
+        json.dumps(
+            {"item": item.model_dump(mode="json")},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    )
 
 
 def _apply_snapshot_timeline_byte_budget(
@@ -1059,12 +977,6 @@ async def session_snapshot(
     session_id: str,
     background_tasks: BackgroundTasks,
     limit: int = Query(100, ge=1, le=500),
-    # Conversation view (session open coverage batch 2): with
-    # ``exclude=agent_children`` the snapshot's timeline page spends its
-    # 100-item window on conversation rows only. The snapshot's own 2MB byte
-    # budget still applies to the returned (filtered) page; without the
-    # parameter the read is byte-for-byte the legacy one.
-    exclude: str | None = Query(None, pattern="^agent_children$"),
     user_id: str = Depends(current_user_id),
     db: Store = Depends(get_store),
     manager: ConnectorRpcManager = Depends(get_rpc),
@@ -1076,6 +988,7 @@ async def session_snapshot(
     timeline_write_buffer: TimelineWriteBuffer = Depends(
         get_timeline_write_buffer
     ),
+    usage_recorder: UsageRecorder = Depends(get_usage_recorder),
 ) -> ProtocolSessionSnapshotResponse:
     snapshot_started_at = time.monotonic()
 
@@ -1093,6 +1006,8 @@ async def session_snapshot(
         stage_started_at = time.monotonic()
         session = await db.get_session(session_id, user_id=user_id)
         log_snapshot_stage("authorization", stage_started_at)
+        # Opening a session is platform usage; the recorder folds quick repeats.
+        await usage_recorder.touch_session_view(session, user_id=user_id)
 
         stage_started_at = time.monotonic()
         notices = await read_session_notices_for_snapshot(manager, session)
@@ -1138,18 +1053,10 @@ async def session_snapshot(
         stage_started_at = time.monotonic()
         async with timeline_write_buffer.session_fence(session_id):
             session = await db.get_session(session_id, user_id=user_id)
-            if exclude is not None:
-                items, has_more = (
-                    await db.list_timeline_latest_excluding_agent_children(
-                        session_id=session_id,
-                        limit=limit,
-                    )
-                )
-            else:
-                items, has_more = await db.list_timeline_latest(
-                    session_id=session_id,
-                    limit=limit,
-                )
+            items, has_more = await db.list_timeline_latest(
+                session_id=session_id,
+                limit=limit,
+            )
             # P1: in-flight Agent cards ride beside the timeline page, outside
             # its (100-item / byte-budget) window and outside the 2MB timeline
             # budget itself. Read under the same fence as `items` so the two

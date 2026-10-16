@@ -7,7 +7,6 @@ from agent_server.core.timeline import (
     latest_timeline_items_by_id,
     timeline_snapshot_is_unchanged,
 )
-from agent_server.infra.db.migrations import upgrade_database
 from agent_server.infra.repositories.facade import Store
 from session_fixtures import create_session_with_project
 
@@ -30,7 +29,11 @@ def timeline_input(
             "source": {
                 "runtime": "codex",
                 "sessionId": "thread_1",
-                "itemId": "runtime-item",
+                # A distinct message carries a distinct Runtime-native id; the
+                # native id is the message's server-side identity (the
+                # live/history convergence keys on it), so a shared spelling
+                # here would model three distinct messages as one.
+                "itemId": f"runtime-{item_id}",
                 "itemType": "agentMessage",
             },
             "orderSeq": order_seq,
@@ -116,9 +119,7 @@ async def test_incremental_sync_does_not_read_complete_timeline(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    db_path = tmp_path / "timeline.sqlite3"
-    upgrade_database(sqlite_path=db_path)
-    store = Store(db_path)
+    store = Store()
     try:
         connector, _, _ = await store.create_connector(name="dev", user_id="user_1")
         session = await create_session_with_project(store, connector_id=connector.id)
@@ -144,9 +145,7 @@ async def test_incremental_sync_does_not_read_complete_timeline(
 
 @pytest.mark.anyio
 async def test_incremental_batch_reserves_consecutive_item_revisions(tmp_path) -> None:
-    db_path = tmp_path / "timeline-revisions.sqlite3"
-    upgrade_database(sqlite_path=db_path)
-    store = Store(db_path)
+    store = Store()
     try:
         connector, _, _ = await store.create_connector(name="dev", user_id="user_1")
         session = await create_session_with_project(store, connector_id=connector.id)
@@ -185,9 +184,7 @@ async def test_complete_snapshot_only_writes_changed_items(
     here because unchanged rows keep their revision either way.
     """
 
-    db_path = tmp_path / "timeline-replace-diff.sqlite3"
-    upgrade_database(sqlite_path=db_path)
-    store = Store(db_path)
+    store = Store()
     try:
         connector, _, _ = await store.create_connector(name="dev", user_id="user_1")
         session = await create_session_with_project(store, connector_id=connector.id)

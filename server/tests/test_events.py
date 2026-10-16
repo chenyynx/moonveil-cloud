@@ -24,7 +24,6 @@ from agent_server.core.events import (
 )
 from agent_server.core.models import SessionView, TimelineItemIn
 from agent_server.infra.connector_rpc import ConnectorRpcManager
-from agent_server.infra.db.migrations import upgrade_database
 from agent_server.infra.repositories.facade import Store
 from agent_server.services import event_recovery
 from agent_server.services.event_recovery import (
@@ -283,9 +282,7 @@ def test_timeline_snapshot_replace_requires_snapshot_for_deleted_items(
     tmp_path,
 ) -> None:
     async def exercise() -> None:
-        path = tmp_path / "events.sqlite3"
-        upgrade_database(sqlite_path=path)
-        store = Store(path)
+        store = Store()
         presence = ConnectorRpcManager()
         try:
             connector, _token, _prefix = await store.create_connector(
@@ -388,7 +385,7 @@ def test_recovery_requires_snapshot_when_the_serialized_delta_exceeds_the_byte_l
             > DEFAULT_RECOVERY_BYTE_LIMIT
         )
 
-    _run_recovery_case(tmp_path, "recovery-byte-limit.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_byte_gate_measures_serialized_utf8_payload_bytes(tmp_path) -> None:
@@ -450,7 +447,7 @@ def test_recovery_byte_gate_measures_serialized_utf8_payload_bytes(tmp_path) -> 
         assert over.events == []
         assert over.nextCursor == event_cursor(sequence)
 
-    _run_recovery_case(tmp_path, "recovery-byte-boundary.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_serves_a_490_item_delta_and_the_count_gate_still_bounds_it(
@@ -507,7 +504,7 @@ def test_recovery_serves_a_490_item_delta_and_the_count_gate_still_bounds_it(
         assert over_count.events == []
         assert over_count.nextCursor == event_cursor(501)
 
-    _run_recovery_case(tmp_path, "recovery-count-gate.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_small_delta_keeps_event_construction_and_cursor(tmp_path) -> None:
@@ -569,7 +566,7 @@ def test_recovery_small_delta_keeps_event_construction_and_cursor(tmp_path) -> N
         )
         assert await _stored_delta_bytes(store, session.id) < DEFAULT_RECOVERY_BYTE_LIMIT
 
-    _run_recovery_case(tmp_path, "recovery-normal-delta.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_snapshot_for_a_cursor_ahead_of_the_durable_sequence(tmp_path) -> None:
@@ -596,7 +593,7 @@ def test_recovery_snapshot_for_a_cursor_ahead_of_the_durable_sequence(tmp_path) 
         assert response.events == []
         assert response.nextCursor == event_cursor(sequence)
 
-    _run_recovery_case(tmp_path, "recovery-cursor-ahead.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_at_the_current_cursor_returns_meta_and_capability(tmp_path) -> None:
@@ -627,7 +624,7 @@ def test_recovery_at_the_current_cursor_returns_meta_and_capability(tmp_path) ->
         assert {event.sequence for event in response.events} == {sequence}
         assert response.nextCursor == event_cursor(sequence)
 
-    _run_recovery_case(tmp_path, "recovery-current-cursor.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 def test_recovery_snapshot_when_the_cursor_precedes_the_timeline_reset(tmp_path) -> None:
@@ -660,7 +657,7 @@ def test_recovery_snapshot_when_the_cursor_precedes_the_timeline_reset(tmp_path)
             max(current_sequence, reset_sequence)
         )
 
-    _run_recovery_case(tmp_path, "recovery-reset.sqlite3", exercise)
+    _run_recovery_case(tmp_path, exercise)
 
 
 @contextmanager
@@ -677,13 +674,10 @@ def captured_loguru():
 
 def _run_recovery_case(
     tmp_path: Path,
-    filename: str,
     action: Callable[[Store, ConnectorRpcManager, SessionView], Awaitable[None]],
 ) -> None:
     async def exercise() -> None:
-        path = tmp_path / filename
-        upgrade_database(sqlite_path=path)
-        store = Store(path)
+        store = Store()
         presence = ConnectorRpcManager()
         try:
             connector, _token, _prefix = await store.create_connector(

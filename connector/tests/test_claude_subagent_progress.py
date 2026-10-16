@@ -34,6 +34,7 @@ wake frames in the L1 file.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from claude_agent_sdk._internal.message_parser import parse_message
@@ -43,6 +44,7 @@ from test_claude_compact_ghost import (
     _wait_until,
 )
 from test_claude_runtime import (
+    StreamEvent,
     _FakeClaudeClient,
     _RecordingHost,
     _ScheduledClaudeClient,
@@ -1806,6 +1808,393 @@ def test_task_updated_after_a_false_done_still_closes() -> None:
             await asyncio.sleep(0.05)
             assert len(_card_items(host, card_id)) == published
             assert _card_items(host, card_id)[-1].status == "done"
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------
+# A background subagent's stream boundary must not re-parent a MAIN row
+# --------------------------------------------------------------------------
+
+
+class _MainThenSubagentStreamClient(_ScheduledClaudeClient):
+    """A main-chain thinking block left open, then a subagent stream frame.
+
+    Real wire 2026-10-14 (pp session ``sess_3vglLn61-wPSSg``): the bridge
+    (LiteLLM) omits a thinking block's ``content_block_stop``, so the block
+    stays open until the next ``message_start``. A background subagent's
+    stream frame leaking into the parent stream carries ``parent_tool_use_id``
+    and its own (differing) message id, so its ``message_start`` is the
+    boundary that closes the main-chain block. The closing frame is the
+    subagent's — that is the whole trap.
+    """
+
+    async def _complete_query(self, prompt: str) -> None:
+        await _FakeClaudeClient.query(self, prompt)
+        frames = [
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={"type": "message_start", "message": {"id": "msg_main_mix"}},
+            ),
+            # The main agent's thinking block — NO content_block_stop follows.
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "主代理的推理"},
+                },
+            ),
+            # A background subagent's stream frame: its message_start is the
+            # boundary that closes the main block, and it carries the parent.
+            StreamEvent(
+                uuid="u2", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={"type": "message_start", "message": {"id": "msg_sub_mix"}},
+            ),
+            # The main agent's final reply frame, then the terminal.
+            SimpleNamespace(
+                type="assistant", uuid="a1", session_id=self.native_id,
+                parent_tool_use_id=None,
+                message={"id": "msg_main_mix", "role": "assistant",
+                         "content": [{"type": "text", "text": "reply"}]},
+            ),
+            SimpleNamespace(type="result", session_id=self.native_id),
+        ]
+        for frame in frames:
+            await self.incoming.put(frame)
+
+
+def test_subagent_stream_boundary_does_not_parent_a_main_reasoning_row() -> None:
+    """The 2026-10-14 mis-attribution, end to end through ``drive_turn``.
+
+    A main-chain thinking block, opened by the main agent and closed by a
+    background subagent's stream boundary, must stay in the main timeline
+    (no ``parentItemId``). Before the fix, ``drive_turn`` stamped the closed
+    batch with the closing frame's parent — the subagent's card — and iOS
+    folded the row into the SubAgent capsule, so pp's reasoning vanished from
+    the main chat. Verified red before the fix (parent == the card) and green
+    after.
+    """
+
+    async def run() -> None:
+        client = _MainThenSubagentStreamClient()
+        host = _RecordingHost()
+        runtime = _runtime_with(host, _single_client_factory(client))
+        try:
+            await runtime.start_turn("mix", None, "go")
+            session = runtime._sessions["mix"]
+            await asyncio.wait_for(session.active_task, 5)
+
+            main_reasoning = [
+                item
+                for item in host.timeline_item_upserts
+                if dict(getattr(item, "source", {}) or {}).get("itemId")
+                == "msg_main_mix"
+                and (item.content or {}).get("blockType") == "thinking"
+            ]
+            assert main_reasoning, "the main thinking row was never published"
+            parent_card = stable_tool_item_id(
+                session, DISPATCH_TUID
+            )
+            leaked = [
+                item for item in main_reasoning
+                if (item.content or {}).get("parentItemId") == parent_card
+            ]
+            assert not leaked, (
+                "a main-agent reasoning row carries the subagent's parentItemId: "
+                f"{[(i.id, i.content.get('parentItemId')) for i in leaked]}"
+            )
+            assert all(
+                (item.content or {}).get("parentItemId") is None
+                for item in main_reasoning
+            ), "a main-agent reasoning row carries an unexpected parentItemId"
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+class _MainBlockStoppedBySubagentClient(_ScheduledClaudeClient):
+    """A main thinking block whose ``content_block_stop`` lands on a subagent frame.
+
+    The bridge that omits ``content_block_stop`` is one wire; a bridge that
+    SENDS it (ccr) can deliver it on a frame carrying a subagent's
+    ``parent_tool_use_id`` (a parented ``StreamEvent``). The accumulator's
+    ``content_block_stop`` route returns the closed row straight to
+    ``drive_turn``, so the row must still keep its OWN (main) parent.
+    """
+
+    async def _complete_query(self, prompt: str) -> None:
+        await _FakeClaudeClient.query(self, prompt)
+        frames = [
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={"type": "message_start", "message": {"id": "msg_main_stop"}},
+            ),
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "thinking", "thinking": "主代理推理"},
+                },
+            ),
+            # The stop arrives on a subagent-parented frame.
+            StreamEvent(
+                uuid="u2", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={"type": "content_block_stop", "index": 0},
+            ),
+            SimpleNamespace(
+                type="assistant", uuid="a1", session_id=self.native_id,
+                parent_tool_use_id=None,
+                message={"id": "msg_main_stop", "role": "assistant",
+                         "content": [{"type": "text", "text": "reply"}]},
+            ),
+            SimpleNamespace(type="result", session_id=self.native_id),
+        ]
+        for frame in frames:
+            await self.incoming.put(frame)
+
+
+def test_main_reasoning_stopped_by_a_subagent_frame_keeps_no_parent() -> None:
+    """The ``content_block_stop`` route must not re-parent a main row either.
+
+    Fourth reasoning-producing path: the accumulator returns the closed row
+    from ``content_block_stop`` directly, and a parented StreamEvent can carry
+    it. The row keeps its own (main) parent.
+    """
+
+    async def run() -> None:
+        client = _MainBlockStoppedBySubagentClient()
+        host = _RecordingHost()
+        runtime = _runtime_with(host, _single_client_factory(client))
+        try:
+            await runtime.start_turn("stopmix", None, "go")
+            session = runtime._sessions["stopmix"]
+            await asyncio.wait_for(session.active_task, 5)
+
+            row = [
+                item
+                for item in host.timeline_item_upserts
+                if dict(getattr(item, "source", {}) or {}).get("itemId")
+                == "msg_main_stop"
+                and (item.content or {}).get("blockType") == "thinking"
+            ]
+            assert row, "the main reasoning row was never published"
+            parent_card = stable_tool_item_id(session, DISPATCH_TUID)
+            assert all((item.content or {}).get("parentItemId") is None for item in row), (
+                "a main reasoning row closed by a subagent content_block_stop "
+                f"carries a parent: {[(i.id, i.content.get('parentItemId')) for i in row]}"
+            )
+            assert not any(
+                (item.content or {}).get("parentItemId") == parent_card for item in row
+            )
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+class _MainTextTouchedBySubagentDeltaClient(_ScheduledClaudeClient):
+    """A main text block, then a subagent frame delivers its `message_delta`.
+
+    The text partial is message-scoped: `message_delta` (which only refreshes
+    usage) can arrive on a different frame than the `message_start`. Here that
+    frame is the subagent's, and the main text row must stay unparented.
+    """
+
+    async def _complete_query(self, prompt: str) -> None:
+        await _FakeClaudeClient.query(self, prompt)
+        frames = [
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={"type": "message_start", "message": {"id": "msg_text_mdelta"}},
+            ),
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": "主代理正文"},
+                },
+            ),
+            # A subagent-parented frame refreshes usage for the SAME message.
+            StreamEvent(
+                uuid="u2", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={"type": "message_delta", "usage": {"output_tokens": 1}},
+            ),
+            SimpleNamespace(
+                type="assistant", uuid="a1", session_id=self.native_id,
+                parent_tool_use_id=None,
+                message={"id": "msg_text_mdelta", "role": "assistant",
+                         "content": [{"type": "text", "text": "主代理正文"}]},
+            ),
+            SimpleNamespace(type="result", session_id=self.native_id),
+        ]
+        for frame in frames:
+            await self.incoming.put(frame)
+
+
+def test_main_text_partial_touched_by_subagent_delta_stays_unparented() -> None:
+    """The `message_delta` text route must not take the consuming frame's parent."""
+
+    async def run() -> None:
+        client = _MainTextTouchedBySubagentDeltaClient()
+        host = _RecordingHost()
+        runtime = _runtime_with(host, _single_client_factory(client))
+        try:
+            await runtime.start_turn("textdelta", None, "go")
+            session = runtime._sessions["textdelta"]
+            await asyncio.wait_for(session.active_task, 5)
+
+            rows = [
+                item
+                for item in host.timeline_item_upserts
+                if dict(getattr(item, "source", {}) or {}).get("itemId")
+                == "msg_text_mdelta"
+                and (item.source or {}).get("event") == "claude.turn.assistant.partial"
+            ]
+            assert rows, "no streamed text partial was published"
+            assert all((item.content or {}).get("parentItemId") is None for item in rows), (
+                "a main text partial carried a parent "
+                f"(last={rows[-1].content.get('parentItemId')})"
+            )
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+class _SubagentTextStreamClient(_ScheduledClaudeClient):
+    """A subagent streams its own text block (parented stream frames)."""
+
+    async def _complete_query(self, prompt: str) -> None:
+        await _FakeClaudeClient.query(self, prompt)
+        frames = [
+            StreamEvent(
+                uuid="u1", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={"type": "message_start", "message": {"id": "msg_sub_text"}},
+            ),
+            StreamEvent(
+                uuid="u1", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": "子代理正文"},
+                },
+            ),
+            SimpleNamespace(
+                type="assistant", uuid="a1", session_id=self.native_id,
+                parent_tool_use_id=None,
+                message={"id": "msg_main_reply", "role": "assistant",
+                         "content": [{"type": "text", "text": "main reply"}]},
+            ),
+            SimpleNamespace(type="result", session_id=self.native_id),
+        ]
+        for frame in frames:
+            await self.incoming.put(frame)
+
+
+def test_subagent_text_partial_keeps_its_card() -> None:
+    """A subagent's streamed text partial must carry its dispatch card.
+
+    Load-bearing: the accumulator stamps the text partial and `drive_turn` no
+    longer applies an ambient parent, so without the stamp a subagent's
+    streamed text would leak into the main timeline (mutation `_partial_item ->
+    return item` makes this red).
+    """
+
+    async def run() -> None:
+        client = _SubagentTextStreamClient()
+        host = _RecordingHost()
+        runtime = _runtime_with(host, _single_client_factory(client))
+        try:
+            await runtime.start_turn("subtext", None, "go")
+            session = runtime._sessions["subtext"]
+            await asyncio.wait_for(session.active_task, 5)
+
+            card = stable_tool_item_id(session, DISPATCH_TUID)
+            rows = [
+                item
+                for item in host.timeline_item_upserts
+                if dict(getattr(item, "source", {}) or {}).get("itemId")
+                == "msg_sub_text"
+                and (item.source or {}).get("event") == "claude.turn.assistant.partial"
+            ]
+            assert rows, "no subagent text partial was published"
+            assert all(
+                (item.content or {}).get("parentItemId") == card for item in rows
+            ), f"a subagent text partial lost its card: {[i.content for i in rows]}"
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
+
+
+class _MainThinkingTouchedBySubagentDeltaClient(_ScheduledClaudeClient):
+    """A main thinking block whose same-index delta arrives from a subagent frame.
+
+    Within one message the block's owner is the frame that opened it; a later
+    same-index delta from another frame (a subagent's stream) must not steal
+    the mark.
+    """
+
+    async def _complete_query(self, prompt: str) -> None:
+        await _FakeClaudeClient.query(self, prompt)
+        frames = [
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={"type": "message_start", "message": {"id": "msg_think_delta"}},
+            ),
+            StreamEvent(
+                uuid="u1", session_id=self.native_id,
+                event={
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "thinking", "thinking": "主代理推理"},
+                },
+            ),
+            # A subagent frame delivers a same-index thinking delta.
+            StreamEvent(
+                uuid="u2", session_id=self.native_id, parent_tool_use_id=DISPATCH_TUID,
+                event={
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "（续）"},
+                },
+            ),
+            SimpleNamespace(
+                type="assistant", uuid="a1", session_id=self.native_id,
+                parent_tool_use_id=None,
+                message={"id": "msg_think_delta", "role": "assistant",
+                         "content": [{"type": "text", "text": "reply"}]},
+            ),
+            SimpleNamespace(type="result", session_id=self.native_id),
+        ]
+        for frame in frames:
+            await self.incoming.put(frame)
+
+
+def test_main_thinking_touched_by_subagent_same_index_delta_stays_unparented() -> None:
+    """The opener of a thinking index owns it; a later subagent delta must not re-stamp it."""
+
+    async def run() -> None:
+        client = _MainThinkingTouchedBySubagentDeltaClient()
+        host = _RecordingHost()
+        runtime = _runtime_with(host, _single_client_factory(client))
+        try:
+            await runtime.start_turn("thinkdelta", None, "go")
+            session = runtime._sessions["thinkdelta"]
+            await asyncio.wait_for(session.active_task, 5)
+
+            rows = [
+                item
+                for item in host.timeline_item_upserts
+                if dict(getattr(item, "source", {}) or {}).get("itemId")
+                == "msg_think_delta"
+                and (item.content or {}).get("blockType") == "thinking"
+            ]
+            assert rows, "no reasoning row was published"
+            assert all((item.content or {}).get("parentItemId") is None for item in rows), (
+                "a main reasoning row was re-stamped by a subagent same-index delta "
+                f"(last={rows[-1].content.get('parentItemId')})"
+            )
         finally:
             await runtime.stop()
 

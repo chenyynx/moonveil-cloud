@@ -21,6 +21,7 @@ from agent_server.core.timeline import (
     latest_timeline_items_by_id,
     native_item_id_from_payload,
     next_timeline_item_revision,
+    timeline_item_content_hash,
     timeline_item_from_runtime_input,
     timeline_item_from_snapshot,
     timeline_item_state_is_unchanged,
@@ -31,8 +32,12 @@ from agent_server.core.utc import utc_now
 from agent_server.infra.db import session_active_runs as active_runs_t
 from agent_server.infra.db import sessions as sessions_t
 from agent_server.infra.db import timeline_items as timeline_items_t
-from agent_server.infra.db.engine import SQLITE_BACKEND
 from agent_server.infra.repositories.store_support import session_revision_fenced
+
+# One shared "the janitor proved nothing is due here" answer. ``changed=False``
+# is what lets the publish layer skip a session-only envelope for a sweep that
+# touched no row, exactly like an unchanged sync batch.
+_JANITOR_NO_CHANGE = TimelineBatchWriteResult(items=(), changed=False)
 
 
 class TimelineRepositoryMixin:
@@ -1108,6 +1113,212 @@ class TimelineRepositoryMixin:
         )
         return sorted(doomed)
 
+    async def stale_running_tool_candidates(
+        self,
+        *,
+        older_than: datetime,
+        limit: int,
+    ) -> list[tuple[str, str]]:
+        """Probe for age-bounded residue: ``running`` tool rows past the bound.
+
+        Only ``type='tool' AND status='running'`` rows are ever candidates: a
+        queued message may legitimately sit ``pending`` across days and a hung
+        approval may legitimately wait in ``waiting_approval``, so an age bound
+        cannot tell those apart from dead residue. When source files vanish
+        entirely (a wiped /tmp workspace, a rotated transcript) no connector
+        rebuild can reach such a row again, so the server janitor is the only
+        floor that will ever close it (``close_stale_running_tool_items``).
+
+        The result is a probe, not a verdict: the age is only proven in
+        Python over parsed timestamps (see ``_timestamp_is_older_than``), the
+        SQL bound stays a deliberately generous lexical superset, and every
+        guard is re-checked inside the close. Ordering by ``item_time`` walks
+        the lexically oldest spellings first, so a capped sweep drains the
+        stalest residue before the cap can matter.
+        """
+
+        probe_bound = _stale_probe_bound(older_than)
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(
+                        timeline_items_t.c.session_id,
+                        timeline_items_t.c.id,
+                        timeline_items_t.c.item_time,
+                    )
+                    .where(
+                        timeline_items_t.c.type == "tool",
+                        timeline_items_t.c.status == "running",
+                        timeline_items_t.c.item_time.is_not(None),
+                        timeline_items_t.c.item_time < probe_bound,
+                    )
+                    .order_by(timeline_items_t.c.item_time, timeline_items_t.c.id)
+                    .limit(limit)
+                )
+            ).all()
+        return [
+            (session_id, item_id)
+            for session_id, item_id, item_time in rows
+            if _timestamp_is_older_than(item_time, older_than)
+        ]
+
+    @session_revision_fenced
+    async def close_stale_running_tool_items(
+        self,
+        *,
+        session_id: str,
+        item_ids: list[str],
+        older_than: datetime,
+        closed_by_evidence: str,
+    ) -> TimelineBatchWriteResult:
+        """Close age-bounded residue rows without deleting them.
+
+        Guards, all re-checked here under the session timeline lock and the
+        caller's revision fence (the probe only narrows the set):
+
+        - the row is still ``type='tool' AND status='running'`` and its stored
+          item time is older than ``older_than`` (a queued message in
+          ``pending`` or an approval in ``waiting_approval`` is never touched
+          whatever its age);
+        - the row has settled: ``updated_seq`` at or below the session fence
+          (a higher value is an in-flight buffered write);
+        - the session has no ``session_active_runs`` row — something is
+          running there right now;
+        - the session is fully silent: ``last_activity_at`` is missing or old
+          and ``updated_at`` is old. A connector observation refreshes
+          ``source_observed_at``/``source_state_at`` but neither of these, so
+          a session that is still being talked about by its connector keeps
+          its rows even when they look old.
+
+        Both silence columns are read, and this writer must leave both alone:
+        the revision bump below passes ``touch_updated_at=False`` precisely
+        because this method is the one writer that must not count as the
+        session being talked about. A janitor that stamped ``updated_at``
+        with its own clock re-armed every session it healed, so any sweep
+        that covered only part of a session (the candidate probe is capped
+        and global) left the remainder ``running`` with nothing left to close
+        it until the whole 48h bound elapsed a second time.
+
+        Closing never deletes: ``status`` becomes ``interrupted`` (a legal
+        terminal value), the embedded payload status follows, the content
+        gains ``closedByEvidence``, and the state hash is recomputed with the
+        canonical item-state formula — so a later Runtime push of the old
+        state reads as a change and supersedes this row through the ordinary
+        higher-``updated_seq`` upsert guard. The revision bump copies the
+        prune precedent (``mark_read=False``): a closure is not content the
+        user has now seen, so it must never consume the unread badge.
+
+        The return type is the prune precedent's ``TimelineBatchWriteResult``
+        so the revision publishes the closed rows: a bare id list reaches
+        ``publish_revision_result`` as an unknown result and yields a
+        session-only envelope with no items and no refetch flag, which moves
+        every client's cursor past the closure without ever telling them the
+        row changed.
+        """
+
+        now = utc_now()
+        closed: list[TimelineItem] = []
+        async with self._timeline_lock(session_id), self._engine.begin() as conn:
+            session_row = (
+                await conn.execute(
+                    select(
+                        sessions_t.c.seq,
+                        sessions_t.c.last_activity_at,
+                        sessions_t.c.updated_at,
+                    )
+                    .where(sessions_t.c.id == session_id)
+                    .with_for_update()
+                )
+            ).first()
+            if session_row is None:
+                raise KeyError(session_id)
+            if not _timestamp_is_older_than(
+                session_row.last_activity_at,
+                older_than,
+                allow_missing=True,
+            ):
+                return _JANITOR_NO_CHANGE
+            if not _timestamp_is_older_than(session_row.updated_at, older_than):
+                return _JANITOR_NO_CHANGE
+            active_run = (
+                await conn.execute(
+                    select(active_runs_t.c.session_id).where(
+                        active_runs_t.c.session_id == session_id
+                    )
+                )
+            ).first()
+            if active_run is not None:
+                return _JANITOR_NO_CHANGE
+            fence = int(session_row.seq)
+            rows = (
+                await conn.execute(
+                    select(
+                        timeline_items_t.c.id,
+                        timeline_items_t.c.type,
+                        timeline_items_t.c.status,
+                        timeline_items_t.c.item_time,
+                        timeline_items_t.c.updated_seq,
+                        timeline_items_t.c.payload_json,
+                    ).where(
+                        timeline_items_t.c.session_id == session_id,
+                        timeline_items_t.c.id.in_(item_ids),
+                    )
+                )
+            ).all()
+            doomed = [
+                TimelineItem.model_validate_json(payload_json)
+                for (
+                    _item_id,
+                    item_type,
+                    status,
+                    item_time,
+                    updated_seq,
+                    payload_json,
+                ) in rows
+                if item_type == "tool"
+                and status == "running"
+                and int(updated_seq) <= fence
+                and _timestamp_is_older_than(item_time, older_than)
+            ]
+            if not doomed:
+                return _JANITOR_NO_CHANGE
+            first_seq = await self._reserve_session_revisions(
+                conn,
+                session_id,
+                count=len(doomed),
+                touch_updated_at=False,
+            )
+            for index, existing in enumerate(sorted(doomed, key=lambda item: item.id)):
+                content = existing.content
+                if isinstance(content, Mapping):
+                    content = {**content, "closedByEvidence": closed_by_evidence}
+                closed.append(
+                    existing.model_copy(
+                        update={
+                            "status": "interrupted",
+                            "content": content,
+                            "contentHash": timeline_item_content_hash(
+                                item_type=existing.type,
+                                status="interrupted",
+                                role=existing.role,
+                                content=content,
+                            ),
+                            "revision": existing.revision + 1,
+                            "updatedSeq": first_seq + index,
+                            "updatedAt": now,
+                        }
+                    )
+                )
+            await self.timeline.upsert_many(conn, closed)
+        if closed:
+            logger.info(
+                "Timeline age janitor closed stale tool rows session_id={} closed={}",
+                session_id,
+                sorted(item.id for item in closed),
+            )
+        return TimelineBatchWriteResult(items=tuple(closed), changed=True)
+
+    @session_revision_fenced
     async def replace_timeline_snapshot(
         self,
         *,
@@ -1379,64 +1590,6 @@ class TimelineRepositoryMixin:
             session_id,
             before_order_seq=before_order_seq,
             limit=limit,
-        )
-
-    async def list_timeline_latest_excluding_agent_children(
-        self,
-        *,
-        session_id: str,
-        limit: int,
-    ) -> tuple[list[TimelineItem], bool]:
-        """The newest conversation-view page (subagent-internal rows excluded).
-
-        Count-limited only: the snapshot applies its own aggregate byte
-        budget to the returned page, so the reader leaves page trimming to
-        the caller.
-        """
-
-        return await self.timeline.list_latest_excluding_agent_children(
-            session_id,
-            limit=limit,
-        )
-
-    async def list_timeline_before_order_seq_excluding_agent_children(
-        self,
-        *,
-        session_id: str,
-        before_order_seq: int,
-        limit: int,
-        byte_budget: int | None = None,
-    ) -> tuple[list[TimelineItem], bool]:
-        """One conversation-view history page: subagent-internal rows are
-        excluded and the page is count- and byte-gated. ``byte_budget=None``
-        keeps the count gate only (store-level callers apply their own
-        budget); the API always passes the resolved page budget."""
-
-        return await self.timeline.list_before_order_seq_excluding_agent_children(
-            session_id,
-            before_order_seq=before_order_seq,
-            limit=limit,
-            byte_budget=byte_budget,
-        )
-
-    async def list_timeline_agent_children(
-        self,
-        *,
-        session_id: str,
-        parent_item_id: str,
-        before_order_seq: int | None,
-        limit: int,
-        byte_budget: int | None = None,
-    ) -> tuple[list[TimelineItem], bool]:
-        """One page of a card's own subagent-internal rows, newest→oldest
-        paging (``before_order_seq`` cursor) with count and byte gates."""
-
-        return await self.timeline.list_agent_children(
-            session_id,
-            parent_item_id=parent_item_id,
-            before_order_seq=before_order_seq,
-            limit=limit,
-            byte_budget=byte_budget,
         )
 
     async def list_active_agent_cards(
@@ -2216,12 +2369,6 @@ class TimelineRepositoryMixin:
     async def _timeline_lock(self, session_id: str) -> AsyncIterator[None]:
         """Serialize concurrent writers for one session timeline."""
 
-        if self.backend == SQLITE_BACKEND:
-            lock = await self.timeline_lock(session_id)
-            async with lock:
-                yield
-            return
-
         lock_key = session_timeline_lock_key(session_id)
         async with self._engine.connect() as conn:
             await conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": lock_key})
@@ -2242,6 +2389,56 @@ class TimelineRepositoryMixin:
 # sub-second fraction spellings), so the SQL probe cannot miss a stale row
 # whose offset spelling sorts after the cutoff string. Rows inside this band
 # ride along and are dropped by the exact parsed comparison.
+_STALE_PROBE_MARGIN_HOURS = 15
+
+
+def _stale_probe_bound(older_than: datetime) -> str:
+    """Lexical superset bound for stored ``item_time`` strings.
+
+    ``item_time`` values are ISO-8601 strings; comparing them against a
+    chronologically formatted cutoff would be wrong across the ``Z`` and
+    ``+00:00`` spellings and across non-UTC offsets, so the SQL probe only
+    narrows the candidate set and ``_timestamp_is_older_than`` proves the age.
+    """
+
+    bound = older_than + timedelta(hours=_STALE_PROBE_MARGIN_HOURS)
+    return bound.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _parse_utc_timestamp(value: str | None) -> datetime | None:
+    """Parse one stored ISO-8601 timestamp; ``None`` when unparsable."""
+
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _timestamp_is_older_than(
+    value: str | None,
+    older_than: datetime,
+    *,
+    allow_missing: bool = False,
+) -> bool:
+    """True only when ``value`` parses and sits before ``older_than``.
+
+    A missing value follows ``allow_missing`` (a session that never recorded
+    activity is silent); an unparsable value is never treated as old — the
+    janitor must never close a row whose age it cannot actually read.
+    """
+
+    if not value:
+        return allow_missing
+    parsed = _parse_utc_timestamp(value)
+    if parsed is None:
+        return False
+    return parsed < older_than
+
 
 async def update_source_observed_at(
     conn: AsyncConnection,
