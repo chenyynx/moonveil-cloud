@@ -42,7 +42,9 @@ STUB_MAX_BYTES = 2048
 #: emitted hundreds of tool calls between two messages would still read them
 #: all. The oldest rows past the cap are dropped and reported through
 #: ``has_more`` so the client can page back through history.
-DEFERRED_WINDOW_MAX_ROWS = 800
+#: [moonveil] 300 while the scroll cost of the wider window is measured on
+#: device; AA carries 800. Everything else about the reader is unchanged.
+DEFERRED_WINDOW_MAX_ROWS = 300
 #: A main-timeline tool activity row larger than this is served from
 #: ``stub_json`` (the writer's render-ready summary) instead of its full
 #: payload. Below the threshold the full payload is cheaper than a second
